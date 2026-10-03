@@ -11,16 +11,16 @@ from bus.message_schema import BusMessage, BusResult
 
 logger = logging.getLogger(__name__)
 
-REQUEST_QUEUE = "query_agent:request_queue"
-RESULT_QUEUE = "query_agent:result_queue"
+REQUEST_QUEUE = "text2sql_agent:request_queue"
+RESULT_QUEUE = "text2sql_agent:result_queue"
 
 
 class RedisMessageBus(MessageBus):
     """
     Redis LIST 实现的消息总线。
 
-    - 请求队列：query_agent:request_queue（所有 Gateway 共用）
-    - 结果队列：query_agent:result_queue（所有 Worker 共用）
+    - 请求队列：text2sql_agent:request_queue（所有 Gateway 共用）
+    - 结果队列：text2sql_agent:result_queue（所有 Worker 共用）
 
     使用 BLPOP 实现阻塞式消费，支持多 Worker 并行。
     """

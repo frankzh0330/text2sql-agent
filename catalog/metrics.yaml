@@ -1,0 +1,99 @@
+# ============================================================
+# Semantic layer (mock of LookML)
+#
+# In production this comes from the BI semantic layer (LookML / dbt semantic
+# models / Cube): governed metric definitions and the join graph live there,
+# not in the physical catalog.
+#
+#   views.<table>.time_dimension — default target column of time filters
+#   joins                        — declarative join graph (never guessed by the LLM)
+#   metrics.<name>.sql           — business metric = ClickHouse aggregate expression
+#   metrics.<name>.view          — owning table (main-table inference for count()-style exprs)
+# ============================================================
+views:
+  orders: {time_dimension: created_at}
+  users: {time_dimension: registered_at}
+  products: {}
+  payments: {time_dimension: paid_at}
+  reviews: {time_dimension: created_at}
+  sellers: {}
+
+joins:
+  - from: orders
+    to: users
+    relationship: many_to_one
+    sql_on: "orders.user_id = users.id"
+  - from: orders
+    to: products
+    relationship: many_to_one
+    sql_on: "orders.product_id = products.id"
+  - from: orders
+    to: payments
+    relationship: one_to_many
+    sql_on: "orders.order_id = payments.order_id"
+  - from: orders
+    to: reviews
+    relationship: one_to_many
+    sql_on: "orders.order_id = reviews.order_id"
+  - from: products
+    to: sellers
+    relationship: many_to_one
+    sql_on: "products.seller_id = sellers.id"
+
+metrics:
+  revenue:
+    view: orders
+    sql: "sum(orders.amount)"
+    description: "Total order amount"
+  order_count:
+    view: orders
+    sql: "count()"
+    description: "Number of orders"
+  avg_order_value:
+    view: orders
+    sql: "avg(orders.amount)"
+    description: "Average order amount"
+  buyer_count:
+    view: orders
+    sql: "uniqExact(orders.user_id)"
+    description: "Distinct users who placed an order"
+  cancel_rate:
+    view: orders
+    sql: "countIf(orders.status = 'canceled') / count()"
+    description: "Share of orders in status canceled"
+  refund_rate:
+    view: orders
+    sql: "countIf(orders.status = 'refunded') / count()"
+    description: "Share of orders in status refunded"
+  avg_freight:
+    view: orders
+    sql: "avg(orders.freight)"
+    description: "Average freight per order"
+  products_sold:
+    view: orders
+    sql: "uniqExact(orders.product_id)"
+    description: "Distinct products that appear in orders"
+  payment_amount:
+    view: payments
+    sql: "sum(payments.amount)"
+    description: "Total amount of payments received"
+  avg_installments:
+    view: payments
+    sql: "avg(payments.installments)"
+    description: "Average number of installments per payment"
+  avg_rating:
+    view: reviews
+    sql: "avg(reviews.rating)"
+    description: "Average review rating"
+  review_count:
+    view: reviews
+    sql: "count()"
+    description: "Number of reviews"
+  positive_review_rate:
+    view: reviews
+    sql: "countIf(reviews.rating >= 4) / count()"
+    description: "Share of reviews with rating 4 or 5"
+  new_user_count:
+    view: users
+    sql: "count()"
+    description: "Number of newly registered users"

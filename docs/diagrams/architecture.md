@@ -47,22 +47,23 @@ graph TB
     subgraph Memory["Memory Layer"]
         LongTermMemory["LongTermMemory<br/>Project Memory"]
         MemoryWriter["MemoryWriter<br/>Async Learning"]
-        UserPreference["UserPreferenceStore<br/>Weak Rerank Signal"]
+        UserPreference["UserPreferenceStore<br/>Weak Pre-decision Bias"]
         Storage["JSONL / Markdown / JSON Storage"]
     end
 
     subgraph Matcher["Matcher Layer"]
-        MatcherService["MatcherService<br/>+ Table/Join Inference"]
-        TableMatcher["TableMatcher"]
-        ColumnMatcher["ColumnMatcher<br/>doc = table.column"]
-        SQLMetricMatcher["SQLMetricMatcher"]
+        MatcherService["MatcherService<br/>Decision + Table/Join Inference"]
+        Policy["policy.py<br/>All Thresholds"]
+        EntityMatcher["EntityMatcher<br/>table / table.column / metric"]
+        Retriever["Retriever (pluggable)<br/>LexicalRetriever: IDF Inverted Index"]
         TimeMatcher["TimeMatcher"]
-        BaseMatcher["BaseMatcher<br/>Inverted Index + RapidFuzz"]
     end
 
-    subgraph Schema["Schema Layer"]
-        SchemaYaml["sql_schema.yaml<br/>tables / columns / joins / metrics"]
-        SchemaLoader["Schema Loader"]
+    subgraph Schema["Metadata Layer"]
+        TablesYaml["tables.yaml<br/>Physical Catalog (Unity Catalog mock)"]
+        MetricsYaml["metrics.yaml<br/>Semantic Layer (LookML mock)"]
+        AliasesYaml["aliases.yaml<br/>Alias Table (source + confidence)"]
+        SchemaLoader["Schema Loader<br/>Source Adapters + Merge"]
     end
 
     subgraph External["External Services"]
@@ -106,14 +107,13 @@ graph TB
     SQLGen --> LLMBackend
     LLM --> LLMBackend
 
-    MatcherService --> TableMatcher
-    MatcherService --> ColumnMatcher
-    MatcherService --> SQLMetricMatcher
+    MatcherService --> EntityMatcher
+    MatcherService --> Policy
     MatcherService --> TimeMatcher
-    TableMatcher -.-> BaseMatcher
-    ColumnMatcher -.-> BaseMatcher
-    SQLMetricMatcher -.-> BaseMatcher
+    EntityMatcher --> Retriever
     MatcherService --> SchemaLoader
-    SchemaLoader --> SchemaYaml
+    SchemaLoader --> TablesYaml
+    SchemaLoader --> MetricsYaml
+    SchemaLoader --> AliasesYaml
     TelegramGateway --> TelegramAPI
 ```

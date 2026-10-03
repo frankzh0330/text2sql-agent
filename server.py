@@ -58,7 +58,7 @@ async def websocket_lifespan(app: FastAPI):
     服务生命周期管理
 
     启动时:
-    1. 初始化 MatcherService（构建索引，一次性加载 catalog/sql_schema.yaml）
+    1. 初始化 MatcherService（构建索引，一次性加载 catalog/ 下 tables / metrics / aliases 三个元数据源）
     2. 创建 MessageBus + AgentWorker + ResponseDispatcher
     3. 启动 Telegram Gateway
     4. 启动 Session 定时清理（每 5 分钟清理 60 分钟未活跃会话）
@@ -126,7 +126,7 @@ async def websocket_lifespan(app: FastAPI):
 
 # 创建带生命周期的 FastAPI 应用
 app_with_ws = FastAPI(
-    title="query-agent: WebSocket + HTTP",
+    title="text2sql-agent: WebSocket + HTTP",
     lifespan=websocket_lifespan,
 )
 

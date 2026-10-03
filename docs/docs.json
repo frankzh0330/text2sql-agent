@@ -22,7 +22,7 @@
     "groups": [
       {
         "group": "Get Started",
-        "pages": ["introduction", "README"]
+        "pages": ["introduction"]
       },
       {
         "group": "Core Concepts",

@@ -2,8 +2,8 @@
 
 对齐参考文档 Semantic Resolution 的"受限 LLM 终选"模式：
 - 只对 recall 已产生的候选重排打分，不得发明新值（输出值必须 ⊆ 输入候选）
-- 仅在低置信场景触发（40-80 确认带或候选存在但未过阈值）
-- relevance >= 85 且领先第二名 margin >= 15 → 静默采纳（把"要问用户"变成"直接答对"）
+- 仅在确认带触发（调用方保证）
+- relevance / margin 过 matcher/policy.py 的 LLM_ACCEPT_* → 静默采纳（把"要问用户"变成"直接答对"）
 - 否则保持确认流，但候选按相关性重排（最优选项排第一）
 - 失败容错：LLM 异常/解析失败 → 返回原序，不影响主流程
 
@@ -18,10 +18,9 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+from matcher import policy
 
-AUTO_ACCEPT_RELEVANCE = 85.0
-AUTO_ACCEPT_MARGIN = 15.0
+logger = logging.getLogger(__name__)
 
 RERANK_SYSTEM_PROMPT = r"""你是检索重排器（cross-encoder 角色）。给定用户查询和一组候选实体，判断每个候选是否是用户所指的对象，打相关性分（0-100）。
 
@@ -157,7 +156,7 @@ async def rerank_candidates(
     second_relevance = scored[1]["relevance"] if len(scored) > 1 else 0.0
     margin = round(top["relevance"] - second_relevance, 2)
     auto_accept = bool(
-        top["relevance"] >= AUTO_ACCEPT_RELEVANCE and margin >= AUTO_ACCEPT_MARGIN
+        top["relevance"] >= policy.LLM_ACCEPT_RELEVANCE and margin >= policy.LLM_ACCEPT_MARGIN
     )
 
     explain = {

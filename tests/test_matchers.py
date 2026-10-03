@@ -8,10 +8,8 @@ from common.text_utils import (
     normalize,
     tokenize_mixed,
 )
-from matcher.column_matcher import ColumnMatcher, build_column_matcher_from_schema
+from matcher.entity_matcher import EntityMatcher, LexicalRetriever, MatchResult, recall_tokens
 from matcher.schema_loader import load_sql_schema
-from matcher.sql_metric_matcher import SQLMetricMatcher, build_sql_metric_matcher_from_schema
-from matcher.table_matcher import TableMatcher, build_table_matcher_from_schema
 from matcher.time_matcher import TimeMatcher
 from matcher.matcher_service import MatcherService
 from common.types import MatcherType
@@ -95,6 +93,15 @@ class TestTextUtils:
         assert "launch" in tokens
         assert "test" in tokens
 
+    def test_tokenize_mixed_camel_case(self):
+        """camelCase 在 lower 之前拆开（此前先 lower 会得到 'shippingfee'）"""
+        assert tokenize_mixed("shippingFee") == ["shipping", "fee"]
+
+    def test_tokenize_mixed_max_tokens_none_keeps_all(self):
+        text = "one two three four five six seven"
+        assert len(tokenize_mixed(text)) == 5
+        assert tokenize_mixed(text, max_tokens=None) == text.split()
+
     def test_tokenize_mixed_chinese(self):
         """测试中文分词"""
         tokens = tokenize_mixed("订单表")
@@ -125,88 +132,82 @@ class TestTextUtils:
 
 
 # =========================
-# TableMatcher 测试
+# EntityMatcher 测试（表）
 # =========================
 
-class TestTableMatcher:
+class TestTableEntities:
     """测试表匹配器"""
 
     @pytest.fixture
     def matcher(self):
-        return build_table_matcher_from_schema(MOCK_TABLES)
+        return EntityMatcher(MOCK_TABLES)
 
-    def test_exact_match(self, matcher: TableMatcher):
+    def test_exact_match(self, matcher: EntityMatcher):
         result = matcher.match("orders")
         assert result.matched == "orders"
         assert result.score == 100.0
 
-    def test_alias_match(self, matcher: TableMatcher):
+    def test_alias_match(self, matcher: EntityMatcher):
         result = matcher.match("订单表")
         assert result.matched == "orders"
         assert result.score == 100.0
 
-    def test_fuzzy_match(self, matcher: TableMatcher):
-        """英文 typo：token 召回 + RapidFuzz 重排（不依赖 jieba 全局词典状态）"""
+    def test_fuzzy_match(self, matcher: EntityMatcher):
+        """英文 typo：token 召回 + 别名打分（不依赖 jieba 全局词典状态）"""
         result = matcher.match("order recrd")
         assert result.matched == "orders"
         assert 70.0 <= result.score < 100.0
 
-    def test_no_match(self, matcher: TableMatcher):
+    def test_no_match(self, matcher: EntityMatcher):
         result = matcher.match("xyz123不存在的")
         assert result.score < 100.0
 
 
 # =========================
-# ColumnMatcher 测试
+# EntityMatcher 测试（列）
 # =========================
 
-class TestColumnMatcher:
+class TestColumnEntities:
     """测试列匹配器（doc = table.column）"""
 
     @pytest.fixture
     def matcher(self):
-        return build_column_matcher_from_schema(MOCK_COLUMNS)
+        return EntityMatcher(MOCK_COLUMNS)
 
-    def test_exact_match(self, matcher: ColumnMatcher):
+    def test_exact_match(self, matcher: EntityMatcher):
         result = matcher.match("region")
         assert result.matched == "users.region"
 
-    def test_chinese_alias_match(self, matcher: ColumnMatcher):
+    def test_chinese_alias_match(self, matcher: EntityMatcher):
         result = matcher.match("地区")
         assert result.matched == "users.region"
 
-    def test_qualified_names_distinguish_tables(self, matcher: ColumnMatcher):
+    def test_qualified_names_distinguish_tables(self, matcher: EntityMatcher):
         """同名列可区分归属表：金额 → orders.amount 而不是别的表的列"""
         result = matcher.match("金额")
         assert result.matched == "orders.amount"
 
-    def test_get_doc(self, matcher: ColumnMatcher):
-        doc = matcher.get_doc("users.region")
-        assert doc is not None
-        assert doc["table"] == "users"
-        assert doc["column"] == "region"
-
 
 # =========================
-# SQLMetricMatcher 测试
+# EntityMatcher 测试（指标）
 # =========================
 
-class TestSQLMetricMatcher:
+class TestMetricEntities:
     """测试业务指标匹配器"""
 
     @pytest.fixture
     def matcher(self):
-        return build_sql_metric_matcher_from_schema(MOCK_METRICS)
+        return EntityMatcher(MOCK_METRICS)
 
-    def test_revenue_match(self, matcher: SQLMetricMatcher):
+    def test_revenue_match(self, matcher: EntityMatcher):
         result = matcher.match("销售额")
         assert result.matched == "revenue"
 
-    def test_order_count_match(self, matcher: SQLMetricMatcher):
+    def test_order_count_match(self, matcher: EntityMatcher):
         result = matcher.match("订单量")
         assert result.matched == "order_count"
 
-    def test_english_alias_match(self, matcher: SQLMetricMatcher):
+    def test_english_alias_match(self, matcher: EntityMatcher):
         result = matcher.match("GMV")
         assert result.matched == "revenue"
 
@@ -286,6 +287,62 @@ class TestSchemaLoader:
         assert j is not None
         assert j["condition"] == "orders.user_id = users.id"
 
+    def test_sources_merged(self, schema):
+        """物理 catalog / 语义层 / alias 表三个源合并到同一实体"""
+        orders = schema.tables["orders"]
+        assert orders["est_rows"] == 80_000_000          # tables.yaml
+        assert orders["time_column"] == "created_at"      # metrics.yaml views
+        assert orders["aliases"][0] == "orders"           # 规范名由 loader 添加
+        assert "purchases" in orders["aliases"]           # aliases.yaml
+        assert schema.columns["orders.status"]["enum_values"][0] == "created"
+
+
+def _write_catalog(tmp_path, aliases_yaml: str, metrics_yaml: str | None = None):
+    (tmp_path / "tables.yaml").write_text(
+        "tables:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - {name: amount, type_text: Float64}\n"
+    )
+    (tmp_path / "metrics.yaml").write_text(metrics_yaml or (
+        "metrics:\n"
+        "  revenue: {view: orders, sql: 'sum(orders.amount)'}\n"
+    ))
+    (tmp_path / "aliases.yaml").write_text(aliases_yaml)
+    return str(tmp_path)
+
+
+class TestCatalogAssembly:
+    """多源合并：置信度 / 审核状态 / 引用校验"""
+
+    def test_confidence_by_source_and_pending_skipped(self, tmp_path):
+        base = _write_catalog(tmp_path, (
+            "aliases:\n"
+            "  - {entity_id: 'metric:revenue', alias: gmv, source: llm}\n"
+            "  - {entity_id: 'metric:revenue', alias: gmv, source: glossary}\n"
+            "  - {entity_id: 'metric:revenue', alias: sales, source: query_log, confidence: 0.4}\n"
+            "  - {entity_id: 'metric:revenue', alias: turnover, source: llm, status: pending}\n"
+        ))
+        weights = load_sql_schema(base).metrics["revenue"]["alias_weights"]
+        assert weights == {"revenue": 1.0, "gmv": 0.9, "sales": 0.4}
+
+    def test_unknown_alias_entity_rejected(self, tmp_path):
+        base = _write_catalog(tmp_path, "aliases:\n  - {entity_id: 'column:orders.nope', alias: x}\n")
+        with pytest.raises(ValueError, match="unknown entity_id"):
+            load_sql_schema(base)
+
+    def test_unknown_alias_source_rejected(self, tmp_path):
+        base = _write_catalog(tmp_path, "aliases:\n  - {entity_id: 'table:orders', alias: x, source: wiki}\n")
+        with pytest.raises(ValueError, match="unknown source"):
+            load_sql_schema(base)
+
+    def test_semantic_layer_reference_checked(self, tmp_path):
+        base = _write_catalog(tmp_path, "aliases: []\n", metrics_yaml=(
+            "joins:\n  - {from: orders, to: users, sql_on: 'orders.user_id = users.id'}\n"
+        ))
+        with pytest.raises(ValueError, match="unknown table 'users'"):
+            load_sql_schema(base)
+
 
 # =========================
 # 运行测试
@@ -324,25 +381,25 @@ class TestEnumNormalization:
 # =========================
 
 class TestRecallEnhancements:
-    """IDF 加权召回 + typo 容忍（matcher/base.py）"""
+    """IDF 加权召回 + typo 容忍（LexicalRetriever）"""
 
     @pytest.fixture
     def schema_matcher(self):
-        return build_table_matcher_from_schema(load_sql_schema("catalog").tables)
+        return EntityMatcher(load_sql_schema("catalog").tables)
 
     def test_typo_in_every_token_still_recalls(self, schema_matcher):
         """'orde tablez' 两个 token 全是 typo：edit-distance-1 探测救回召回"""
         result = schema_matcher.match("orde tablez")
         assert result.matched == "orders"
         assert result.score >= 80.0
-        assert result.explain["recall_explain"]["typo_matched"] == {
+        assert result.explain["recall"]["lexical"]["typo_matched"] == {
             "orde": "order", "tablez": "table",
         }
 
     def test_typo_probe_ignored_for_short_tokens(self, schema_matcher):
         """<4 字符 token 不做探测（避免 'id'/'if' 这类误纠）"""
         result = schema_matcher.match("id xyzq")
-        assert result.explain["recall_explain"]["candidate_count"] == 0
+        assert result.explain["recall"]["lexical"]["candidate_count"] == 0
 
     def test_idf_weighting_prefers_rare_token_doc(self):
         """命中数打平时，命中稀有 token 的文档胜出（朴素计数下按 doc id 任意排序）"""
@@ -352,9 +409,8 @@ class TestRecallEnhancements:
             "doc_c": {"aliases": ["alpha", "alpha six", "alpha seven"], "columns": {}},
             "doc_rare": {"aliases": ["zephyr dashboard"], "columns": {}},
         }
-        m = build_table_matcher_from_schema(catalog)
         # 'alpha' 高 df（3/4 文档），'zephyr' 仅 1 个文档
-        _, explain = m._recall_candidates(["alpha", "zephyr"])
+        _, explain = LexicalRetriever(catalog).retrieve("alpha zephyr", k=10)
         top = explain["top_candidates"][0]
         assert top["name"] == "doc_rare"
         # 原始命中数一致（各 1），但加权分不同
@@ -362,9 +418,91 @@ class TestRecallEnhancements:
         assert all(top["score"] > c["score"] for c in others)
 
     def test_recall_explain_keeps_raw_hit_count(self, schema_matcher):
-        _, explain = schema_matcher._recall_candidates(["order", "table"])
+        _, explain = schema_matcher.retrievers[0].retrieve("order table", k=10)
         for c in explain["top_candidates"]:
             assert "hit_count" in c and "score" in c
+
+    def test_recall_tokens_truncate_after_stopwords(self):
+        """停用词不占 token 名额：by/for/each/of/the 被过滤后才截断到 5 个"""
+        tokens = recall_tokens("Total revenue by region for each of the top sellers")
+        assert tokens == ["total", "revenue", "region", "top", "seller"]
+
+    def test_recall_tokens_split_camel_case(self):
+        assert recall_tokens("shippingFee") == ["shipping", "fee"]
+
+    def test_long_alias_tail_tokens_are_indexed(self):
+        """别名侧同样先去停用词再截断：长别名尾部的判别词进入倒排索引"""
+        catalog = {
+            "doc_long": {"aliases": ["share of the orders in each of the regions"]},
+            "doc_other": {"aliases": ["order share"]},
+        }
+        retriever = LexicalRetriever(catalog)
+        assert retriever.token_to_names.get("region") == ["doc_long"]
+
+
+class TestAliasScoring:
+    """别名打分：置信度加权 / 长别名不截断 / 子串命中方向 / 可插拔 retriever"""
+
+    @pytest.fixture(scope="class")
+    def schema(self):
+        return load_sql_schema("catalog")
+
+    def test_short_query_does_not_substring_hit_longer_alias(self, schema):
+        """'customer' 不应以 90 分子串命中 reviews 的 'customer reviews'，复数归一后 exact 命中 users"""
+        r = EntityMatcher(schema.tables).match("customer")
+        assert r.matched == "users"
+        assert r.explain["method"] == "exact_alias_match"
+        assert r.candidates[0]["alias"] == "customer"  # 'customers' 的 match key
+        reviews = [c for c in r.candidates if c["name"] == "reviews"]
+        assert not reviews or reviews[0]["score"] < 70
+
+    def test_plural_query_exact_hits_singular_alias(self, schema):
+        """'product categories' 与别名 'product category' 复数折叠后 exact 命中（-ies → -y）"""
+        r = EntityMatcher(schema.columns).match("product categories")
+        assert (r.matched, r.score, r.explain["method"]) == ("products.category", 100.0, "exact_alias_match")
+
+    def test_stem_keeps_ss_us_is_endings(self):
+        from matcher.entity_matcher import match_key
+        assert match_key("Addresses status analysis") == "addresse status analysis"
+        assert match_key("categories orders") == "category order"
+
+    def test_bare_entity_noun_as_metric_is_count(self, schema):
+        """L1 常把 'How many orders' 抽成指标 'orders'：alias 表把它映射为 order_count"""
+        r = EntityMatcher(schema.metrics).match("orders")
+        assert (r.matched, r.score) == ("order_count", 100.0)
+
+    def test_long_query_still_hits_shorter_alias(self, schema):
+        """query 比别名长（加了修饰词）仍允许子串命中"""
+        r = EntityMatcher(schema.metrics).match("total revenue")
+        assert r.matched == "revenue"
+
+    def test_long_aliases_are_indexed(self, schema):
+        """>20 字符的别名不再被静默丢弃"""
+        r = EntityMatcher(schema.metrics).match("gross merchandise value")
+        assert r.matched == "revenue"
+        assert r.explain["method"] == "exact_alias_match"
+
+    def test_alias_confidence_scales_score(self):
+        m = EntityMatcher({
+            "revenue": {"aliases": ["revenue", "turnover"], "alias_weights": {"turnover": 0.6}},
+        })
+        r = m.match("turnover")
+        assert r.candidates == [{"name": "revenue", "score": 60.0, "alias": "turnover"}]
+
+    def test_pluggable_retriever_candidates_are_unioned(self):
+        """额外 retriever（如 embedding）召回词法召回不到的实体，打分仍走别名"""
+
+        class FakeSemantic:
+            name = "semantic"
+
+            def retrieve(self, query, k):
+                return ["revenue"], {"note": "fake"}
+
+        entities = {"revenue": {"aliases": ["income"]}, "orders": {"aliases": ["orders"]}}
+        m = EntityMatcher(entities, retrievers=[LexicalRetriever(entities), FakeSemantic()])
+        r = m.match("earnings")  # 无 exact 别名、词法召回不到，只能靠额外 retriever
+        assert r.matched == "revenue"
+        assert set(r.explain["recall"]) == {"lexical", "semantic"}
 
 
 class TestTypeThresholds:
@@ -409,6 +547,64 @@ class TestTypeThresholds:
         assert r.needs_confirmation is False
 
 
+class TestDecisionOrder:
+    """候选 → 偏好弱加权 → 分档：偏好在判定前生效，且判定只有一处"""
+
+    @staticmethod
+    def _svc(score_a, score_b):
+        svc = MatcherService.__new__(MatcherService)
+        svc.table_matcher = FakeMatcher({"q": _mr_with_cands(
+            "orders", score_a, [("orders", score_a), ("payments", score_b)])})
+        return svc
+
+    def test_bias_applies_before_banding(self):
+        """85 vs 80 并列 → 偏好给 orders +6 后拉开分差 → 直接采纳"""
+        assert self._svc(85.0, 80.0).resolve_with_candidates(MatcherType.TABLE, [_E("q")]).method == "fuzzy_tied"
+        r = self._svc(85.0, 80.0).resolve_with_candidates(MatcherType.TABLE, [_E("q")], bias=_bias_orders)
+        assert (r.value, r.needs_confirmation, r.method) == ("orders", False, "fuzzy")
+
+    def test_bias_cannot_lift_candidate_over_accept_line(self):
+        """原始分 76 < 采纳线 80：偏好 +6 后 82 也不能静默采纳，只能排第一进确认流"""
+        r = self._svc(76.0, 40.0).resolve_with_candidates(MatcherType.TABLE, [_E("q")], bias=_bias_orders)
+        assert (r.value, r.needs_confirmation, r.method) == ("orders", True, "fuzzy_low_confidence")
+
+    def test_bias_cannot_lift_candidate_over_confirm_floor(self):
+        """原始分 36 < CONFIRM_FLOOR：偏好加分后仍视为无匹配"""
+        r = self._svc(36.0, 10.0).resolve_with_candidates(MatcherType.TABLE, [_E("q")], default="", bias=_bias_orders)
+        assert (r.method, r.needs_confirmation) == ("no_match", False)
+
+    def test_bias_flip_marked_and_still_banded(self):
+        """偏好把第二名推到第一时标注 +user_bias，且仍按分档判定（55 分仍需确认）"""
+        def bias(cands):
+            return [{"value": "payments", "score": 56.0, "raw_score": 50.0},
+                    {"value": "orders", "score": 55.0, "raw_score": 55.0}]
+        r = self._svc(55.0, 50.0).resolve_with_candidates(MatcherType.TABLE, [_E("q")], bias=bias)
+        assert r.value == "payments"
+        assert r.needs_confirmation is True
+        assert r.method == "fuzzy_low_confidence+user_bias"
+
+    def test_below_floor_is_no_match(self):
+        r = self._svc(30.0, 10.0).resolve_with_candidates(MatcherType.TABLE, [_E("q")], default="orders")
+        assert (r.value, r.method, r.needs_confirmation) == ("orders", "no_match", False)
+
+    def test_low_confidence_column_goes_to_confirmation_not_guessed(self):
+        """列低置信/并列不再静默取 top1：'customer' 在 orders.user_id / users.id 并列"""
+        from service.query_orchestrator import QueryOrchestrator
+
+        svc = MatcherService(catalog_path="catalog")
+        sink: dict = {}
+        cols, entries = QueryOrchestrator._resolve_texts_to_columns(None, svc, ["customer"], sink)
+        assert cols == []
+        assert {c["value"] for c in entries[0]["confirm_candidates"]} == {"orders.user_id", "users.id"}
+
+
+def _bias_orders(cands):
+    """模拟 UserPreferenceStore：orders +6，保留 raw_score"""
+    return sorted(
+        [{**c, "raw_score": c["score"], "score": c["score"] + (6 if c["value"] == "orders" else 0)} for c in cands],
+        key=lambda c: -c["score"])
+
+
 class _E:
     def __init__(self, text):
         self.text = text
@@ -423,14 +619,12 @@ class FakeMatcher:
     def match(self, text):
         if text in self.results:
             return self.results[text]
-        from matcher.base import MatchResult
-        return MatchResult(matched=None, score=0.0, explain={})
+        return MatchResult(matched=None, score=0.0)
 
 
 def _mr_with_cands(matched, score, candidates):
-    from matcher.base import MatchResult
-    explain = {"rerank_explain": {"top5": [{"name": v, "score": s} for v, s in candidates]}}
-    return MatchResult(matched=matched, score=score, explain=explain)
+    cands = [{"name": v, "score": s} for v, s in candidates]
+    return MatchResult(matched=matched, score=score, candidates=cands)
 
 
 class TestExactAliasCollision:
@@ -438,21 +632,21 @@ class TestExactAliasCollision:
 
     @pytest.fixture
     def column_matcher(self):
-        return build_column_matcher_from_schema(load_sql_schema("catalog").columns)
+        return EntityMatcher(load_sql_schema("catalog").columns)
 
     def test_collision_detected(self, column_matcher):
         """'amount' 在 orders/payments 两列 → matched=None + 冲突候选"""
         r = column_matcher.match("amount")
         assert r.matched is None
         assert r.explain["method"] == "exact_alias_collision"
-        names = {c["name"] for c in r.explain["collision_candidates"]}
+        names = {c["name"] for c in r.candidates}
         assert names == {"orders.amount", "payments.amount"}
 
     def test_three_way_collision(self, column_matcher):
         """'time' 三路冲突（orders/payments/reviews 的时间列）"""
         r = column_matcher.match("time")
         assert r.explain["method"] == "exact_alias_collision"
-        assert len(r.explain["collision_candidates"]) == 3
+        assert len(r.candidates) == 3
 
     def test_unique_alias_unaffected(self, column_matcher):
         r = column_matcher.match("payment type")

@@ -13,7 +13,7 @@ export TELEGRAM_BOT_TOKEN="your_bot_token_here"
 # LLM 配置
 export LLM_BACKEND="zhipu"  # 或 "ollama"
 export ZHIPU_API_KEY="your_zhipu_key"  # 如果用 zhipu
-export OLLAMA_BASE_URL="http://localhost:11434"  # 如果用 ollama
+export OLLAMA_BASE_URL="http://localhost:11434/v1"  # 如果用 ollama
 ```
 
 ### 2. 启动服务
@@ -75,7 +75,7 @@ http://localhost:8000/docs
 curl http://localhost:8000/sessions
 ```
 
-### 直接测试 NL2SQL API
+### 直接测试 Text2SQL API
 
 ```bash
 curl -X POST http://localhost:8000/nl2sql \

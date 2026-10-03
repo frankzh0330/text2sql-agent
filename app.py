@@ -1,4 +1,4 @@
-"""Query Agent API — FastAPI 端点定义
+"""Text2SQL Agent API — FastAPI 端点定义
 
 app.py 只负责：
 1. FastAPI 实例 + 请求/响应模型
@@ -23,7 +23,7 @@ from memory.storage.memory_file import TaskStorage
 from memory.user_preference_store import UserPreferenceStore
 from service.query_orchestrator import QueryOrchestrator
 
-app = FastAPI(title="query-agent: NL to ClickHouse SQL")
+app = FastAPI(title="text2sql-agent: NL to ClickHouse SQL")
 logger = logging.getLogger(__name__)
 
 # ====================

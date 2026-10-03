@@ -10,7 +10,7 @@
 #            current implementation and the value is the reason. strict=True, so a
 #            fix flips it to a failure until the marker is removed.
 #
-# The matcher scenario `real` uses the real MatcherService over catalog/sql_schema.yaml.
+# The matcher scenario `real` uses the real MatcherService over catalog/ (tables.yaml / metrics.yaml / aliases.yaml).
 # SQL generation (generate_sql) is mocked: the evaluated stages are
 #   intent parsing -> matcher resolution -> state merging -> confirmation flow -> SQL-gen inputs
 #

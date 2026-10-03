@@ -1,7 +1,7 @@
 """长期记忆管理器
 
-读取 MEMORY.md 索引文件中引用的记忆文件，拼接后用于注入 system prompt。
-按 project_id 分桶，避免跨项目污染。
+读取 MEMORY.md 索引文件中引用的记忆文件，拆成条目后按本轮 query 选择相关条目，
+拼接后用于注入 system prompt。按 project_id 分桶，避免跨项目污染。
 
 存储结构:
   data/memory/
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_MEMORY_LINES = 50
 _MAX_MEMORY_BYTES = 5000
+_MAX_SELECTED_PARTS = 5
 
 
 class LongTermMemory:
@@ -33,8 +34,8 @@ class LongTermMemory:
     def __init__(self, data_path: str = "data/memory"):
         self.data_path = Path(data_path)
         self.data_path.mkdir(parents=True, exist_ok=True)
-        # 缓存: key=(project_id,), value=拼接后的内容
-        self._cache: Dict[Tuple[int, ...], str] = {}
+        # 缓存: key=(project_id,), value=记忆条目列表（选择前的原始条目）
+        self._cache: Dict[Tuple[int, ...], list[str]] = {}
         self._cache_mtime: Dict[Tuple[int, ...], float] = {}
 
     def load_memory_context(
@@ -53,15 +54,27 @@ class LongTermMemory:
         Args:
             project_id: 项目ID，为 None 时只加载全局记忆
         """
+        parts = self._load_parts(project_id)
+        if not parts:
+            logger.debug(f"LongTermMemory: no memory found for project={project_id}")
+            return ""
+
+        # 选择依赖本轮 query，必须每次重新做；缓存只缓存磁盘读取结果
+        selected_parts = self._select_relevant_parts(parts, query_text=query_text, last_query_state=last_query_state)
+        result = self._truncate("\n\n".join(selected_parts))
+        logger.debug(f"LongTermMemory: selected {len(selected_parts)}/{len(parts)} entries, {len(result)} chars for project={project_id}")
+        return result
+
+    def _load_parts(self, project_id: Optional[int]) -> list[str]:
+        """读取 _global + project_{id} 下的全部记忆条目（按 mtime 缓存，与 query 无关）"""
         cache_key = (project_id,) if project_id is not None else (None,)
 
-        # 检查缓存
         if cache_key in self._cache and not self._is_cache_stale(cache_key):
             logger.debug(f"LongTermMemory: cache hit for project={project_id}")
             return self._cache[cache_key]
 
         logger.debug(f"LongTermMemory: loading from disk for project={project_id}")
-        parts = []
+        parts: list[str] = []
 
         # 1. 加载全局记忆
         global_dir = self.data_path / "_global"
@@ -76,18 +89,9 @@ class LongTermMemory:
             if project_parts:
                 parts.extend(project_parts)
 
-        if not parts:
-            logger.debug(f"LongTermMemory: no memory found for project={project_id}")
-            return ""
-
-        selected_parts = self._select_relevant_parts(parts, query_text=query_text, last_query_state=last_query_state)
-        result = "\n\n".join(selected_parts)
-        result = self._truncate(result)
-
-        self._cache[cache_key] = result
+        self._cache[cache_key] = parts
         self._cache_mtime[cache_key] = self._latest_mtime(project_id)
-        logger.debug(f"LongTermMemory: loaded {len(result)} chars for project={project_id}")
-        return result
+        return parts
 
     def _load_dir(self, directory: Path) -> list[str]:
         """读取某个目录下的 MEMORY.md 索引及其引用的文件"""
@@ -115,13 +119,32 @@ class LongTermMemory:
                         content = file_path.read_text(encoding="utf-8")
                         # 去掉 frontmatter（--- ... ---）
                         content = re.sub(r"^---\n.*?\n---\n", "", content, flags=re.DOTALL)
-                        stripped = content.strip()
-                        if stripped:
-                            parts.append(stripped)
+                        parts.extend(self._split_entries(content))
                     except OSError as e:
                         logger.warning(f"Failed to read memory file {file_path}: {e}")
 
         return parts
+
+    @staticmethod
+    def _split_entries(content: str) -> list[str]:
+        """把一个记忆文件拆成可独立选择的条目
+
+        纯列表文件（如 auto_learned.md，每行一条 "- [category] ..."）按顶层列表项拆分，
+        否则整个文件作为一个条目（手写的说明性文档保持完整）。
+        """
+        stripped = content.strip()
+        if not stripped:
+            return []
+        lines = stripped.split("\n")
+        if not all(line.startswith("- ") or line.startswith("  ") or not line.strip() for line in lines):
+            return [stripped]
+        entries: list[str] = []
+        for line in lines:
+            if line.startswith("- "):
+                entries.append(line)
+            elif line.strip() and entries:
+                entries[-1] += "\n" + line
+        return entries
 
     def _select_relevant_parts(
         self,
@@ -145,7 +168,7 @@ class LongTermMemory:
 
         matched = [part for score, _, part in sorted(scored_parts, key=lambda item: (item[0], item[1]), reverse=True) if score > 0]
         if matched:
-            return matched[:3]
+            return matched[:_MAX_SELECTED_PARTS]
 
         # 没有命中时保守回退，避免完全丢失上下文
         return parts[:2]

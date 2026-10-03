@@ -1,4 +1,4 @@
-# Query Agent - 架构设计文档
+# Text2SQL Agent - 架构设计文档
 
 ## 全局约定
 
@@ -36,7 +36,7 @@ flowchart TD
     ORC --> FU --> MRG
     ORC <--> TASK
 
-    subgraph Pipeline["NL2SQL Pipeline"]
+    subgraph Pipeline["Text2SQL Pipeline"]
         L1["Layer 1: LLM 意图抽取<br/>llm_extractions.py"]
         L2["Layer 2: Matcher 解析<br/>table / column / metric / time<br/>matcher/"]
         RR["LLM Reranker（可选，低置信带）<br/>reranker.py"]
@@ -48,7 +48,10 @@ flowchart TD
     L4 -->|失败: 错误回灌, 最多 2 轮| L3
     L4 --> OUT["ClickHouse SQL"]
 
-    CAT[("catalog/sql_schema.yaml")] --> SL["schema_loader.py<br/>SQLSchema + 倒排索引"] --> L2
+    UC[("catalog/tables.yaml<br/>物理 catalog（模拟 Unity Catalog）")] --> SL
+    SEM[("catalog/metrics.yaml<br/>语义层（模拟 LookML）：指标 + join")] --> SL
+    ALS[("catalog/aliases.yaml<br/>alias 表（来源 + 置信度）")] --> SL
+    SL["schema_loader.py<br/>多源合并 → SQLSchema"] --> L2
 
     subgraph Mem["Memory Layer"]
         PM["Project Memory<br/>long_term_memory.py"]
@@ -77,11 +80,11 @@ flowchart TD
 | | Follow-up | `service/followup_resolver.py` `service/query_state_merger.py` | 判断 turn 模式，patch 合并结构化 QueryState |
 | | Task | `service/task_manager.py` | 低置信歧义的显式确认流（可跨重启恢复） |
 | **Pipeline** | Layer 1 抽取 | `service/llm_extractions.py` | NL → `SQLIntentJson`（只摘录用户原话） |
-| | Layer 2 解析 | `matcher/*` | IDF 倒排召回 + typo 探测 + RapidFuzz 重排；阈值/并列守卫；别名冲突暴露；主表推断；join 推断 |
+| | Layer 2 解析 | `matcher/*` | `EntityMatcher`：可插拔召回（默认 IDF 倒排 + typo 探测）+ 别名打分（相似度 × 别名置信度）；`policy.py` 统一阈值/并列守卫；别名冲突暴露；主表推断；join 推断 |
 | | Reranker | `service/reranker.py` | 可选，仅对已有候选做受限 LLM 终选 |
 | | Layer 3 生成 | `service/sql_generator.py` | 用已解析实体组装 prompt，LLM 直出 ClickHouse SQL |
 | | Layer 4 校验 | `service/sql_validator.py` `service/sql_ast_analyzer.py` | 只读、白名单、默认 LIMIT；AST 级列存在性、join 合法性、实体保真 |
-| **Metadata** | Catalog | `catalog/sql_schema.yaml` `matcher/schema_loader.py` | 表/列/指标/别名/join/enum（demo 态 YAML，启动时一次性加载） |
+| **Metadata** | Catalog | `catalog/tables.yaml` `catalog/metrics.yaml` `catalog/aliases.yaml` `matcher/schema_loader.py` | 三个文件各模拟一个元数据系统（物理 catalog / 语义层 / alias 表），各由一个 source adapter 读取后合并；启动时一次性加载 |
 | **Memory** | Project / User / Writer | `memory/*` | 项目级 corrections、用户偏好弱信号、异步学习 |
 | **Debug** | MCP Server | `mcp_server.py` | token / recall / rerank 调试工具 |
 
@@ -96,7 +99,7 @@ QueryOrchestrator ←→ Session / Task / Follow-up 状态
     ↓
 Layer 1  LLM 意图抽取          ← Project Memory
     ↓
-Layer 2  Matcher 确定性解析     ← SQLSchema 倒排索引 / User Preference
+Layer 2  Matcher 确定性解析     ← SQLSchema（三源合并）/ User Preference
     ↓        （低置信 → Reranker 或确认流）
 Layer 3  LLM SQL 生成（实体名固定）
     ↓
@@ -119,4 +122,4 @@ MemoryWriter 沉淀长期记忆
 
 # 个人笔记
 
-> Query Agent 个人笔记，后续继续补充。
+> Text2SQL Agent 个人笔记，后续继续补充。

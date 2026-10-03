@@ -10,7 +10,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from matcher.base import MatchResult
+from matcher.entity_matcher import MatchResult
 from matcher.matcher_service import MatcherService
 from service.llm_extractions import Extraction, FilterExtraction, SQLIntentJson
 from service.session_models import QueryState
@@ -64,10 +64,8 @@ def _make_intent(payload: dict | None) -> SQLIntentJson:
 # ==================== matcher mock（真实服务 + 假匹配层） ====================
 
 def _mr(matched, score, candidates=None) -> MatchResult:
-    explain = {}
-    if candidates:
-        explain["rerank_explain"] = {"top5": [{"name": v, "score": s} for v, s in candidates]}
-    return MatchResult(matched=matched, score=score, explain=explain)
+    cands = [{"name": v, "score": s} for v, s in (candidates or [])]
+    return MatchResult(matched=matched, score=score, candidates=cands)
 
 
 class FakeMatcher:
@@ -83,7 +81,7 @@ class FakeMatcher:
 def _build_service(name: str) -> MatcherService:
     """matcher 场景
 
-    real                 — 真实 MatcherService（倒排索引 + RapidFuzz），评测 schema 别名 + 匹配逻辑
+    real                 — 真实 MatcherService（召回 + 别名打分），评测 schema 别名 + 匹配逻辑
     low_confidence_table — 真实 service + 假 table matcher，稳定复现确认流（55 分，介于确认带内）
     """
     svc = MatcherService(catalog_path="catalog")

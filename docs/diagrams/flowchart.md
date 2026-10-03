@@ -41,17 +41,18 @@ flowchart TD
     Confirm --> Resolve
 
     subgraph Resolve["Layer 2: Matcher Resolution"]
-        Table["TableMatcher"]
-        Metric["SQLMetricMatcher"]
-        Column["ColumnMatcher"]
+        Cands["EntityMatcher candidates<br/>table / metric / column"]
+        Bias["User preference bias"]
+        Decide["Decide (matcher/policy.py)<br/>accept / confirm / no_match"]
         Time["TimeMatcher"]
         Infer["Table inference +<br/>join inference"]
-        Table --> Metric --> Column --> Time --> Infer
+        Cands --> Bias --> Decide --> Time --> Infer
     end
 
-    Infer --> Rerank["User preference rerank<br/>+ optional LLM rerank"]
-    Rerank --> Ambiguous{"Needs confirmation?"}
-    Ambiguous -->|Yes| Task["Create TaskContext<br/>Return candidates"]
+    Infer --> Ambiguous{"Needs confirmation?"}
+    Ambiguous -->|Yes| Rerank["Optional LLM rerank<br/>(may auto-accept)"]
+    Rerank -->|auto-accepted| GenSQL
+    Rerank -->|still ambiguous| Task["Create TaskContext<br/>Return candidates"]
     Task --> EndConfirm(("Wait for user reply"))
     Ambiguous -->|No| GenSQL
 

@@ -1,36 +1,54 @@
-"""SQL Schema 加载器
+"""Catalog 加载器：多元数据源 → 内存中的 SQLSchema
 
-从本地 YAML 加载表/列/join/指标元数据（演示态）。
-生产方向：从 metadata service 定时同步后调用本模块重建索引（见 README Production Notes）。
+每个文件模拟一个企业里的独立元数据系统，各由一个 source adapter 读取，
+再由 load_sql_schema 合并（matcher / AST analyzer 只依赖合并后的 SQLSchema）：
+
+  catalog/tables.yaml   ← 物理 catalog（模拟 Unity Catalog）：表/列/类型/注释/owner/行数/枚举采样
+  catalog/metrics.yaml  ← 语义层（模拟 LookML）：指标定义、join 图、默认时间维度
+  catalog/aliases.yaml  ← alias 表：(entity_id, alias, source, confidence, status)
+
+生产方向：把 adapter 换成对应系统的 API 客户端，定时同步后重建索引（见 README Production Notes）。
 
 产出结构：
-  tables:   {table_name: {aliases, description, time_column, columns: {col: {aliases, type}}}}
-  joins:    [{left, right, on}]
-  metrics:  {metric_id: {aliases, expr, description}}
+  tables:   {table: {aliases, alias_weights, description, owner, time_column, est_rows,
+                     columns: {col: {type, comment, enum_values}}}}
+  columns:  {"table.column": {table, column, type, comment, enum_values, aliases, alias_weights}}
+  joins:    [{left, right, condition, relationship}]
+  metrics:  {metric_id: {aliases, alias_weights, expr, table, description}}
 """
 from __future__ import annotations
 
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 
 import yaml
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SCHEMA_FILE = "sql_schema.yaml"
+TABLES_FILE = "tables.yaml"
+METRICS_FILE = "metrics.yaml"
+ALIASES_FILE = "aliases.yaml"
+
+# alias 来源 → 默认置信度（单行可用 confidence 覆盖）
+ALIAS_SOURCE_CONFIDENCE = {
+    "catalog": 1.0,    # 规范名本身（loader 自动添加）
+    "curated": 1.0,
+    "glossary": 0.9,
+    "comment": 0.7,
+    "query_log": 0.6,
+    "feedback": 0.6,
+    "llm": 0.5,
+}
 
 
 @dataclass(frozen=True)
 class SQLSchema:
     tables: Dict[str, Dict]
-    columns: Dict[str, Dict]          # "table.column" -> {table, column, aliases, type}
+    columns: Dict[str, Dict]          # "table.column" -> {table, column, aliases, type, ...}
     joins: List[Dict] = field(default_factory=list)
     metrics: Dict[str, Dict] = field(default_factory=dict)
-    table_alias_lookup: Dict[str, str] = field(default_factory=dict)
-    column_alias_lookup: Dict[str, str] = field(default_factory=dict)
-    metric_alias_lookup: Dict[str, str] = field(default_factory=dict)
     join_graph: Dict[str, List[Dict]] = field(default_factory=dict)  # table -> [{peer, condition}]
 
     def normalize_enum_value(self, qualified_column: str, value):
@@ -77,106 +95,164 @@ class SQLSchema:
                 return j
         return None
 
-    def join_path_from(self, base_table: str, needed_tables: set[str]) -> List[Dict]:
-        """从主表出发，为所需表收集 join 步骤（单跳；多跳留待生产扩展）"""
-        steps = []
-        for t in sorted(needed_tables):
-            if t == base_table:
-                continue
-            j = self.find_join(base_table, t)
-            if j:
-                steps.append(j)
-        return steps
-
     def to_schema_prompt(self, max_tables: int = 10) -> str:
         """渲染给 LLM 的 schema 摘要（供 SQL 生成 prompt 使用）"""
         lines = []
         for t_name, t_info in list(self.tables.items())[:max_tables]:
-            cols = ", ".join(
-                f"{c} {c_info.get('type', 'String')}"
-                for c, c_info in t_info.get("columns", {}).items()
-            )
+            cols = []
+            for c, c_info in t_info.get("columns", {}).items():
+                col = f"{c} {c_info.get('type', 'String')}"
+                if c_info.get("enum_values"):
+                    col += " in (" + ",".join(f"'{v}'" for v in c_info["enum_values"]) + ")"
+                cols.append(col)
             desc = t_info.get("description", "")
-            lines.append(f"- {t_name} ({desc}): {cols}")
+            lines.append(f"- {t_name} ({desc}): {', '.join(cols)}")
         for j in self.joins:
-            cond = j.get("condition") or j.get("on") or ""
-            lines.append(f"- JOIN: {j['left']} ↔ {j['right']} ON {cond}")
+            lines.append(f"- JOIN: {j['left']} ↔ {j['right']} ON {j['condition']}")
         for m_id, m_info in self.metrics.items():
             lines.append(f"- METRIC {m_id} = {m_info['expr']}")
         return "\n".join(lines)
 
 
-def _norm(s: str) -> str:
-    return (s or "").strip().lower().replace(" ", "")
+# =========================
+# Source adapters（每个对应一个企业元数据系统）
+# =========================
+
+def _read_yaml(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def load_physical_catalog(path: str) -> Dict[str, Dict]:
+    """物理 catalog（模拟 Unity Catalog list_tables）→ {table: {description, owner, est_rows, columns}}"""
+    raw = _read_yaml(path)
+    tables: Dict[str, Dict] = {}
+    for t in raw.get("tables", []) or []:
+        columns = {
+            c["name"]: {
+                "type": c.get("type_text", "String"),
+                "comment": c.get("comment", ""),
+                "enum_values": list(c.get("distinct_values", []) or []),
+            }
+            for c in t.get("columns", []) or []
+        }
+        tables[t["name"]] = {
+            "description": t.get("comment", ""),
+            "owner": t.get("owner", ""),
+            "est_rows": int((t.get("properties") or {}).get("num_rows", 0) or 0),
+            "columns": columns,
+        }
+    return tables
+
+
+def load_semantic_layer(path: str) -> Tuple[Dict[str, str], List[Dict], Dict[str, Dict]]:
+    """语义层（模拟 LookML）→ (time_dimensions, joins, metrics)"""
+    raw = _read_yaml(path)
+    time_dims = {
+        view: (info or {}).get("time_dimension", "")
+        for view, info in (raw.get("views", {}) or {}).items()
+    }
+    joins = [
+        {"left": j["from"], "right": j["to"], "condition": j["sql_on"],
+         "relationship": j.get("relationship", "")}
+        for j in raw.get("joins", []) or []
+    ]
+    metrics = {
+        m_id: {"expr": m["sql"], "table": m.get("view", ""), "description": m.get("description", "")}
+        for m_id, m in (raw.get("metrics", {}) or {}).items()
+    }
+    return time_dims, joins, metrics
+
+
+def load_alias_table(path: str) -> List[Dict]:
+    """alias 表 → [{entity_id, alias, source, confidence}]（只保留 approved 行）"""
+    raw = _read_yaml(path)
+    rows: List[Dict] = []
+    for r in raw.get("aliases", []) or []:
+        source = r.get("source", "curated")
+        if source not in ALIAS_SOURCE_CONFIDENCE:
+            raise ValueError(f"aliases.yaml: unknown source {source!r} for {r}")
+        if r.get("status", "approved") != "approved":
+            continue
+        rows.append({
+            "entity_id": r["entity_id"],
+            "alias": str(r["alias"]),
+            "source": source,
+            "confidence": float(r.get("confidence", ALIAS_SOURCE_CONFIDENCE[source])),
+        })
+    return rows
+
+
+# =========================
+# 合并
+# =========================
+
+def _attach_aliases(entity: Dict, canonical: str, rows: List[Dict]) -> None:
+    """规范名（置信度 1.0）+ alias 表行 → entity["aliases"] / entity["alias_weights"]
+
+    同一别名多来源时取最高置信度。
+    """
+    weights: Dict[str, float] = {canonical: ALIAS_SOURCE_CONFIDENCE["catalog"]}
+    for r in rows:
+        weights[r["alias"]] = max(weights.get(r["alias"], 0.0), r["confidence"])
+    entity["aliases"] = list(weights.keys())
+    entity["alias_weights"] = weights
 
 
 def load_sql_schema(base_dir: str = "catalog") -> SQLSchema:
-    """加载 SQL schema YAML 并构建别名查找表"""
-    path = os.path.join(base_dir, DEFAULT_SCHEMA_FILE)
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
+    """读取三个元数据源并合并为 SQLSchema（引用不存在的实体直接报错，fail fast）"""
+    tables = load_physical_catalog(os.path.join(base_dir, TABLES_FILE))
+    time_dims, joins, metrics = load_semantic_layer(os.path.join(base_dir, METRICS_FILE))
+    alias_rows = load_alias_table(os.path.join(base_dir, ALIASES_FILE))
 
-    schema_node = raw.get("schema", {})
-    tables: Dict[str, Dict] = schema_node.get("tables", {}) or {}
-    joins: List[Dict] = schema_node.get("joins", []) or []
-    metrics: Dict[str, Dict] = schema_node.get("metrics", {}) or {}
+    by_entity: Dict[str, List[Dict]] = {}
+    for r in alias_rows:
+        by_entity.setdefault(r["entity_id"], []).append(r)
 
-    # 展开列为 "table.column" 文档（同名列可区分归属表）
+    # 语义层引用必须存在于物理 catalog
+    for view, col in time_dims.items():
+        if view not in tables:
+            raise ValueError(f"metrics.yaml: view {view!r} not in physical catalog")
+        if col and col not in tables[view]["columns"]:
+            raise ValueError(f"metrics.yaml: time_dimension {view}.{col} not in physical catalog")
+    for j in joins:
+        for t in (j["left"], j["right"]):
+            if t not in tables:
+                raise ValueError(f"metrics.yaml: join references unknown table {t!r}")
+    for m_id, m in metrics.items():
+        if m["table"] and m["table"] not in tables:
+            raise ValueError(f"metrics.yaml: metric {m_id!r} references unknown view {m['table']!r}")
+
+    known_ids = set()
     columns: Dict[str, Dict] = {}
     for t_name, t_info in tables.items():
-        for c_name, c_info in (t_info.get("columns", {}) or {}).items():
+        t_info["time_column"] = time_dims.get(t_name, "")
+        _attach_aliases(t_info, t_name, by_entity.get(f"table:{t_name}", []))
+        known_ids.add(f"table:{t_name}")
+        # 展开列为 "table.column" 文档（同名列可区分归属表）
+        for c_name, c_info in t_info["columns"].items():
             qualified = f"{t_name}.{c_name}"
-            aliases = [c_name] + list(c_info.get("aliases", []) or [])
-            columns[qualified] = {
-                "table": t_name,
-                "column": c_name,
-                "type": c_info.get("type", "String"),
-                "enum_values": list(c_info.get("enum_values", []) or []),
-                "aliases": list(dict.fromkeys(aliases)),
-            }
+            col = {"table": t_name, "column": c_name, **c_info}
+            _attach_aliases(col, c_name, by_entity.get(f"column:{qualified}", []))
+            columns[qualified] = col
+            known_ids.add(f"column:{qualified}")
 
-    table_alias_lookup: Dict[str, str] = {}
-    for t_name, t_info in tables.items():
-        for alias in [t_name] + list(t_info.get("aliases", []) or []):
-            nk = _norm(alias)
-            if nk:
-                table_alias_lookup[nk] = t_name
-
-    column_alias_lookup: Dict[str, str] = {}
-    for qualified, c_info in columns.items():
-        for alias in c_info["aliases"]:
-            nk = _norm(alias)
-            if nk:
-                # 同名别名先到先得（确定性），歧义由 ColumnMatcher 候选列表暴露
-                column_alias_lookup.setdefault(nk, qualified)
-
-    metric_alias_lookup: Dict[str, str] = {}
     for m_id, m_info in metrics.items():
-        for alias in [m_id] + list(m_info.get("aliases", []) or []):
-            nk = _norm(alias)
-            if nk:
-                metric_alias_lookup[nk] = m_id
+        _attach_aliases(m_info, m_id, by_entity.get(f"metric:{m_id}", []))
+        known_ids.add(f"metric:{m_id}")
+
+    unknown = sorted(set(by_entity) - known_ids)
+    if unknown:
+        raise ValueError(f"aliases.yaml: unknown entity_id(s) {unknown}")
 
     # join 邻接表（无向）
-    # 注意：YAML 1.1 会把裸 `on` 解析为布尔 True，因此约定 key 为 condition（兼容 on）
     join_graph: Dict[str, List[Dict]] = {}
     for j in joins:
-        cond = j.get("condition") or j.get(True) or j.get("on") or ""
-        join_graph.setdefault(j["left"], []).append({"peer": j["right"], "condition": cond})
-        join_graph.setdefault(j["right"], []).append({"peer": j["left"], "condition": cond})
-        j["condition"] = cond
+        join_graph.setdefault(j["left"], []).append({"peer": j["right"], "condition": j["condition"]})
+        join_graph.setdefault(j["right"], []).append({"peer": j["left"], "condition": j["condition"]})
 
     logger.debug(
-        "SQL schema loaded: %d tables, %d columns, %d metrics",
-        len(tables), len(columns), len(metrics),
+        "Catalog loaded: %d tables, %d columns, %d metrics, %d alias rows",
+        len(tables), len(columns), len(metrics), len(alias_rows),
     )
-    return SQLSchema(
-        tables=tables,
-        columns=columns,
-        joins=joins,
-        metrics=metrics,
-        table_alias_lookup=table_alias_lookup,
-        column_alias_lookup=column_alias_lookup,
-        metric_alias_lookup=metric_alias_lookup,
-        join_graph=join_graph,
-    )
+    return SQLSchema(tables=tables, columns=columns, joins=joins, metrics=metrics, join_graph=join_graph)

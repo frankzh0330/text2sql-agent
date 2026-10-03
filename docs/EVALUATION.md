@@ -2,13 +2,13 @@
 title: "Evaluation Strategy"
 ---
 
-[Chinese version](https://github.com/frankzh0330/query-agent/blob/master/docs/EVALUATION.zh-CN.md)
+[Chinese version](https://github.com/frankzh0330/text2sql-agent/blob/master/docs/EVALUATION.zh-CN.md)
 
-This document explains how `query-agent` is evaluated today, what the current end-to-end eval harness covers, and how to expand it safely as the agent evolves.
+This document explains how `text2sql-agent` is evaluated today, what the current end-to-end eval harness covers, and how to expand it safely as the agent evolves.
 
 ## Why Evaluation Matters Here
 
-`query-agent` is not just a matcher or a prompt wrapper. It has:
+`text2sql-agent` is not just a matcher or a prompt wrapper. It has:
 
 - turn-based follow-up handling
 - session persistence
@@ -61,9 +61,9 @@ Purpose:
 
 Examples:
 
-- [tests/test_app_endpoints.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_app_endpoints.py)
-- [tests/test_session_manager.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_session_manager.py)
-- [tests/test_task_manager.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_task_manager.py)
+- [tests/test_app_endpoints.py](https://github.com/frankzh0330/text2sql-agent/blob/master/tests/test_app_endpoints.py)
+- [tests/test_session_manager.py](https://github.com/frankzh0330/text2sql-agent/blob/master/tests/test_session_manager.py)
+- [tests/test_task_manager.py](https://github.com/frankzh0330/text2sql-agent/blob/master/tests/test_task_manager.py)
 
 Good for:
 
@@ -81,14 +81,14 @@ Purpose:
 
 Main files:
 
-- [tests/evals/nl2sql_cases.yaml](https://github.com/frankzh0330/query-agent/blob/master/tests/evals/nl2sql_cases.yaml)
-- [tests/test_end_to_end_evals.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_end_to_end_evals.py)
+- [tests/evals/nl2sql_cases.yaml](https://github.com/frankzh0330/text2sql-agent/blob/master/tests/evals/nl2sql_cases.yaml)
+- [tests/test_end_to_end_evals.py](https://github.com/frankzh0330/text2sql-agent/blob/master/tests/test_end_to_end_evals.py)
 
 This harness is intentionally closer to “golden cases” than pure unit testing.
 
 ## Current Case Inventory (45 cases, 9 groups)
 
-Cases in [tests/evals/nl2sql_cases.yaml](https://github.com/frankzh0330/query-agent/blob/master/tests/evals/nl2sql_cases.yaml) are grouped by capability:
+Cases in [tests/evals/nl2sql_cases.yaml](https://github.com/frankzh0330/text2sql-agent/blob/master/tests/evals/nl2sql_cases.yaml) are grouped by capability:
 
 | Group | Count | Covers |
 |---|---|---|
@@ -108,7 +108,7 @@ Cases whose *correct* behavior is asserted but not yet implemented carry an `xfa
 
 ## Live Eval (real LLM, no mocks)
 
-[scripts/live_eval.py](https://github.com/frankzh0330/query-agent/blob/master/scripts/live_eval.py) reuses the same YAML expectations but runs the real LLM for extraction and SQL generation — measuring what the mocked pytest eval cannot: extraction quality and SQL quality. Cases that require a forced mock are skipped automatically.
+[scripts/live_eval.py](https://github.com/frankzh0330/text2sql-agent/blob/master/scripts/live_eval.py) reuses the same YAML expectations but runs the real LLM for extraction and SQL generation — measuring what the mocked pytest eval cannot: extraction quality and SQL quality. Cases that require a forced mock are skipped automatically.
 
 ```bash
 ./.venv311/bin/python scripts/live_eval.py            # all runnable cases
@@ -116,7 +116,12 @@ Cases whose *correct* behavior is asserted but not yet implemented carry an `xfa
 ./.venv311/bin/python scripts/live_eval.py --out eval_results/run.json
 ```
 
-Latest run (after exact-alias collision handling): **36/36 regular cases pass, 34/34 generated SQL valid (sqlglot), 33/33 metric expressions faithfully used, avg latency ~6.9s**; 4 cases that need a forced mock were skipped, and the 5 known-gap cases still fail as expected. LLM output varies between runs, so treat this as one sample.
+Latest run (current code, zhipu backend, 2026-10-04): **36/36 regular cases pass, 34/34 generated SQL valid (sqlglot), 33/33 metric expressions faithfully used, avg latency ~7.6s**; 4 cases that need a forced mock were skipped (f05, a03, u06, u07), and the 5 known-gap cases still fail as expected. LLM output varies between runs, so treat this as one sample.
+
+This run fixes a regression that appeared after the catalog split (31/36 at the time): 5 regular cases stopped at `needs_confirmation` because real LLM extraction fragments differ from the ideal fragments in the mocks. The fix has two parts:
+
+- matcher: the query and aliases are plural-folded before exact lookup and scoring, so `product categories` exact-hits `product category` (w01)
+- alias table: a new curated alias `orders → order_count` covers extractions that use the bare word `orders` as the metric (s03, t03, f02, f04)
 
 ## Current E2E Eval Format
 
@@ -130,30 +135,26 @@ Example shape:
 
 ```yaml
 cases:
-  - name: followup_confirmation_flow
+  - name: u06_followup_confirmation_flow
     setup:
       last_query_state:
         project_id: 55
         tables: ["orders"]
         metrics: ["revenue"]
-        time_range:
-          type: last_n_days
-          n: 7
+        time_range: {type: last_n_days, n: 7}
         group_by: ["orders.channel"]
         filters: []
         turn_type: new_query
     steps:
       - text: Compare with the products table
-        project_id: 55
         extraction:
-          table_extractions: ["products"]
+          table_extractions: ["products table"]
         resolver: low_confidence_table
         expect:
           status: needs_confirmation
           turn_mode: followup_patch
           candidates_contains: tables
       - text: "1"
-        project_id: 55
         expect:
           status: success
           turn_mode: confirmation
@@ -166,25 +167,22 @@ cases:
 
 The current runner supports:
 
-- pre-seeded `last_query_state`
-- mocked extraction output (`SQLIntentJson` fragments)
-- mocked resolver scenarios (high-confidence / low-confidence table)
+- `setup.last_query_state`: a pre-seeded previous query state (multi-turn precondition)
+- `setup.project_memory`: pre-seeded project memory entries, paired with `assert_memory_contains` to assert the memory really reached the extraction context
+- `extraction`: mocked extraction output (`SQLIntentJson` fragments, i.e. what an ideal extractor emits)
+- `resolver` scenarios: `real` (the real `MatcherService` over the three `catalog/` sources) and `low_confidence_table` (real service + fake table matcher that reliably lands in the 55-point confirmation band)
 - mocked SQL generation (the harness pins the deterministic core:
   matchers, thresholds, state merging, confirmation flow, persistence)
 - multi-step session continuity
-- `project_memory` setup
-- `restart_before: true` for restart simulation
-- assertions on:
-  - `status`
+- `restart_before: true` for restart simulation (session / task managers are rebuilt and recovered from disk)
+- case-level markers: `xfail` (strict known gap) and `live_skip` (skipped by the live eval because it needs a forced mock extraction)
+- `expect` assertions:
+  - `status` / `status_not`
   - `turn_mode`
-  - `resolved_intent.tables`
-  - `resolved_intent.metrics`
-  - `resolved_intent.group_by`
-  - `resolved_intent.time_range.n`
-  - `resolved_intent.window` (grouped ranking)
-  - `resolved_intent.filters`
-  - join inference into the SQL-generation intent (`sql_intent_contains_join`)
-  - candidate presence
+  - `message_contains`
+  - `candidates_contains`
+  - `resolved_intent`: `tables`, `metrics`, `group_by`, `group_by_contains`, `time_n`, `time_type`, `order_direction`, `order_limit`, `window_group`, `window_limit`, `filter_column`, `filter_value`
+  - SQL-generation inputs: `time_expr_contains` (time expression) and `sql_intent_contains_join` (inferred join)
 
 ## Current Covered Scenarios
 
@@ -224,7 +222,7 @@ Examples:
 
 ### 2. Memory Cases
 
-Examples:
+Already covered: u09 project memory injected into the extraction context; unit tests cover per-query, entry-level selection and keeping personal preferences out of project memory. Still worth adding:
 
 - project memory changes a default metric or filter mapping
 - project memory changes default region behavior
@@ -232,25 +230,24 @@ Examples:
 
 ### 3. User Preference Cases
 
-Examples:
+Already covered (unit / endpoint tests, not yet in YAML): preference rerank reorders confirmation candidates, and preference cannot boost a candidate over the accept line or the confirm floor. Still worth adding:
 
-- preference rerank changes candidate order
-- preference remains scoped by `project_id + user_id`
+- preference remains scoped by `project_id + user_id` (a cross-user isolation e2e case)
 - preference does not override obviously better semantic matches
+- move these scenarios into YAML cases (needs `user_id` and preference seeding in the harness)
 
 ### 4. Restart / Recovery Cases
 
-Examples:
+Already covered: u07 confirmation after restart. Still worth adding:
 
 - follow-up after restart
-- confirmation after restart
 - session restored but no pending task
 
 ## What E2E Eval Is Not Meant To Do
 
 The current harness is not meant to:
 
-- verify real LLM quality online
+- measure real LLM extraction / SQL quality (that is the job of `scripts/live_eval.py`)
 - verify actual downstream query correctness against production databases
 - replace matcher unit tests
 

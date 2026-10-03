@@ -1,9 +1,11 @@
-"""User-scoped preference signals for post-recall reranking."""
+"""User-scoped preference signals: a bounded candidate bias applied after recall, before the accept/confirm decision."""
 from __future__ import annotations
 
 import json
 import logging
 import math
+import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -24,6 +26,8 @@ class UserPreferenceStore:
     def __init__(self, data_path: str = "data/user_preferences"):
         self.data_path = Path(data_path)
         self.data_path.mkdir(parents=True, exist_ok=True)
+        # load → increment → save 是读改写序列，并发请求下需串行
+        self._write_lock = threading.Lock()
 
     def record_selection(
         self,
@@ -37,21 +41,17 @@ class UserPreferenceStore:
         if not user_id:
             return
 
-        data = self._load(project_id, user_id)
-        updated = False
+        if not (table or metric or columns):
+            return
 
-        if table:
-            self._increment(data["tables"], table)
-            updated = True
-        if metric:
-            self._increment(data["metrics"], metric)
-            updated = True
-        if columns:
-            for column in columns:
+        with self._write_lock:
+            data = self._load(project_id, user_id)
+            if table:
+                self._increment(data["tables"], table)
+            if metric:
+                self._increment(data["metrics"], metric)
+            for column in columns or []:
                 self._increment(data["columns"], column)
-                updated = True
-
-        if updated:
             self._save(project_id, user_id, data)
 
     def get_bucket(self, project_id: int, user_id: str | None, field_name: str) -> Dict[str, int]:
@@ -126,8 +126,11 @@ class UserPreferenceStore:
             return {"tables": {}, "metrics": {}, "columns": {}}
 
     def _save(self, project_id: int, user_id: str, data: Dict[str, Dict[str, int]]) -> None:
+        # 先写临时文件再原子替换，避免读到半截 JSON
         path = self._path(project_id, user_id)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
     @staticmethod
     def _increment(bucket: Dict[str, int], key: str) -> None:

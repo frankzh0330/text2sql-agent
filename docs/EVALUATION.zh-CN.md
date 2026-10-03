@@ -2,11 +2,11 @@
 
 [English](EVALUATION.md) | [简体中文](EVALUATION.zh-CN.md)
 
-本文说明 `query-agent` 当前如何做评估、现有 end-to-end eval harness 覆盖了什么，以及后续应该如何安全扩展。
+本文说明 `text2sql-agent` 当前如何做评估、现有 end-to-end eval harness 覆盖了什么，以及后续应该如何安全扩展。
 
 ## 为什么这个项目必须做评估
 
-`query-agent` 已经不只是一个 matcher 或 prompt wrapper。它现在有：
+`text2sql-agent` 已经不只是一个 matcher 或 prompt wrapper。它现在有：
 
 - turn-based follow-up handling
 - session persistence
@@ -113,7 +113,12 @@
 ./.venv311/bin/python scripts/live_eval.py --out eval_results/run.json
 ```
 
-最近一轮（exact 别名冲突处理之后）：**常规 36/36 通过、SQL 语法 34/34、指标口径保真 33/33、平均延迟 ~6.9s**；4 条依赖强制 mock 的用例跳过，5 条已知缺口用例如预期失败。LLM 输出每次有波动，这只是一次采样。
+最近一轮（当前代码，zhipu 后端，2026-10-04）：**常规 36/36 通过、SQL 语法 34/34、指标口径保真 33/33、平均延迟 ~7.6s**；4 条依赖强制 mock 的用例跳过（f05、a03、u06、u07），5 条已知缺口用例如预期失败。LLM 输出每次有波动，这只是一次采样。
+
+这一轮修复了元数据拆分后出现的回归（当时 31/36）：5 条常规用例都停在 `needs_confirmation`，原因是真实 LLM 的抽取片段与 mock 中的理想片段不同。修复分两处：
+
+- matcher：query 与别名在单复数折叠后再做 exact / 打分，`product categories` exact 命中 `product category`（w01）
+- alias 表：新增 curated 别名 `orders → order_count`，覆盖把裸词 `orders` 抽成指标的说法（s03、t03、f02、f04）
 
 ## 当前 E2E Eval 格式
 
@@ -127,30 +132,26 @@
 
 ```yaml
 cases:
-  - name: followup_confirmation_flow
+  - name: u06_followup_confirmation_flow
     setup:
       last_query_state:
         project_id: 55
         tables: ["orders"]
         metrics: ["revenue"]
-        time_range:
-          type: last_n_days
-          n: 7
+        time_range: {type: last_n_days, n: 7}
         group_by: ["orders.channel"]
         filters: []
         turn_type: new_query
     steps:
-      - text: 对比商品表
-        project_id: 55
+      - text: Compare with the products table
         extraction:
-          table_extractions: ["商品表"]
+          table_extractions: ["products table"]
         resolver: low_confidence_table
         expect:
           status: needs_confirmation
           turn_mode: followup_patch
           candidates_contains: tables
       - text: "1"
-        project_id: 55
         expect:
           status: success
           turn_mode: confirmation
@@ -163,24 +164,21 @@ cases:
 
 当前 runner 已支持：
 
-- 预置 `last_query_state`
-- mocked extraction output（`SQLIntentJson` 片段）
-- mocked resolver scenario（高置信 / 低置信表名）
+- `setup.last_query_state`：预置上一轮查询状态（多轮前置条件）
+- `setup.project_memory`：预置项目记忆条目，配合 `assert_memory_contains` 断言记忆确实注入了抽取上下文
+- `extraction`：mocked 抽取输出（`SQLIntentJson` 片段，即理想抽取器应产出的内容）
+- `resolver` 场景：`real`（真实 `MatcherService` + `catalog/` 三源元数据）、`low_confidence_table`（真实 service + 假表 matcher，稳定复现 55 分确认带）
 - mocked SQL 生成（harness 锁定确定性内核：matcher、阈值、状态合并、确认流、持久化）
 - 多步 session 连续性
-- `project_memory` setup
-- `restart_before: true` 重启模拟
-- 对以下内容做断言：
-  - `status`
+- `restart_before: true` 重启模拟（重建 session / task manager 后从磁盘恢复）
+- 用例级标记：`xfail`（strict 已知缺口）、`live_skip`（live eval 跳过，依赖强制 mock 抽取）
+- `expect` 断言：
+  - `status` / `status_not`
   - `turn_mode`
-  - `resolved_intent.tables`
-  - `resolved_intent.metrics`
-  - `resolved_intent.group_by`
-  - `resolved_intent.time_range.n`
-  - `resolved_intent.window`（分组排名）
-  - `resolved_intent.filters`
-  - join 推断结果进入 SQL 生成入参（`sql_intent_contains_join`）
-  - candidate presence
+  - `message_contains`
+  - `candidates_contains`
+  - `resolved_intent`：`tables`、`metrics`、`group_by`、`group_by_contains`、`time_n`、`time_type`、`order_direction`、`order_limit`、`window_group`、`window_limit`、`filter_column`、`filter_value`
+  - SQL 生成入参：`time_expr_contains`（时间表达式）、`sql_intent_contains_join`（推断出的 join）
 
 ## 当前已覆盖场景
 
@@ -220,7 +218,7 @@ cases:
 
 ### 2. Memory 场景
 
-例如：
+已覆盖：u09 项目记忆注入抽取上下文；单测覆盖按 query 的条目级选择、个人偏好不写入项目记忆。还可以补：
 
 - project memory 改变默认指标或过滤映射
 - project memory 改变默认 region 行为
@@ -228,25 +226,24 @@ cases:
 
 ### 3. User Preference 场景
 
-例如：
+已覆盖（单测 / endpoint 测试，尚未进 YAML）：preference rerank 改变确认候选顺序、偏好不能把未过采纳线或下限的候选加分过线。还可以补：
 
-- preference rerank 改变候选顺序
-- preference 严格限制在 `project_id + user_id`
+- preference 严格限制在 `project_id + user_id`（跨用户隔离的 e2e case）
 - preference 不应该覆盖明显更强的语义匹配
+- 把上述场景迁成 YAML case（需要在 harness 里支持 `user_id` 与偏好预置）
 
 ### 4. Restart / Recovery 场景
 
-例如：
+已覆盖：u07 重启后确认。还可以补：
 
 - follow-up after restart
-- confirmation after restart
 - session 恢复了但 pending task 不存在
 
 ## E2E Eval 不打算做什么
 
 当前 harness 不打算：
 
-- 在线评估真实 LLM 质量
+- 评估真实 LLM 的抽取 / SQL 质量（这是 `scripts/live_eval.py` 的职责）
 - 对生产数据库做真实下游查询正确性验证
 - 替代 matcher 的 unit tests
 
@@ -257,7 +254,7 @@ cases:
 
 ## 如何运行
 
-只跑 end-to-end harness：
+只跑 end-to-end harness（设置 `EVAL_IGNORE_XFAIL=1` 可查看已知缺口用例的真实状态）：
 
 ```bash
 ./.venv311/bin/pytest -q tests/test_end_to_end_evals.py
@@ -282,7 +279,7 @@ cases:
 1. 如果主要是“场景变化”，优先写进 YAML。
 2. 如果新增了纯逻辑，也要补 unit test。
 3. 断言尽量聚焦稳定字段。
-4. 除非必要，不要断完整 `exec_dsl` 字符串。
+4. 除非必要，不要断完整 SQL 字符串。
 5. 优先断 semantic 层，而不是表面格式。
 
 ## 长期方向

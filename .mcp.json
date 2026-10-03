@@ -1,11 +1,11 @@
 {
   "mcpServers": {
-    "query_agent": {
-      "command": "/Users/frank/frank_project/query-agent/.venv311/bin/python",
+    "text2sql_agent": {
+      "command": "/Users/frank/frank_project/text2sql-agent/.venv311/bin/python",
       "args": [
         "mcp_server.py"
       ],
-      "cwd": "/Users/frank/frank_project/query-agent"
+      "cwd": "/Users/frank/frank_project/text2sql-agent"
     }
   }
 }

@@ -61,7 +61,7 @@ class TestMemoryWriter:
         project_dir.mkdir(parents=True)
 
         writer._append_memory(project_dir, "correction", "第一条")
-        writer._append_memory(project_dir, "preference", "第二条")
+        writer._append_memory(project_dir, "constraint", "第二条")
 
         lines = (project_dir / "auto_learned.md").read_text().strip().split("\n")
         assert len(lines) == 2
@@ -128,10 +128,10 @@ class TestMemoryWriter:
         assert not auto.exists()
 
     @pytest.mark.asyncio
-    async def test_maybe_save_writes_when_llm_says_yes(self, tmp_path):
+    async def test_maybe_save_skips_user_scoped_preference(self, tmp_path):
+        """个人偏好不属于项目知识，不能写进 project memory 注入给其他用户"""
         from memory.memory_writer import MemoryWriter
         writer = MemoryWriter(data_path=str(tmp_path / "memory"))
-
         writer._judge = mock.AsyncMock(return_value={
             "should_save": True,
             "category": "preference",
@@ -146,11 +146,32 @@ class TestMemoryWriter:
             current_state={"metric": "uv"},
         )
 
+        assert not (tmp_path / "memory" / "project_55" / "auto_learned.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_maybe_save_writes_when_llm_says_yes(self, tmp_path):
+        from memory.memory_writer import MemoryWriter
+        writer = MemoryWriter(data_path=str(tmp_path / "memory"))
+
+        writer._judge = mock.AsyncMock(return_value={
+            "should_save": True,
+            "category": "constraint",
+            "content": "本项目的'交易表'对应 orders 表",
+        })
+
+        await writer.maybe_save(
+            project_id=55,
+            user_query="交易表的销售额",
+            extraction={"table": "交易表"},
+            resolver_explain={"table": {"score": 0, "value": "orders"}},
+            current_state={"tables": ["orders"]},
+        )
+
         auto = tmp_path / "memory" / "project_55" / "auto_learned.md"
         assert auto.exists()
         content = auto.read_text()
-        assert "用户偏好查询UV而非PV" in content
-        assert "[preference]" in content
+        assert "本项目的'交易表'对应 orders 表" in content
+        assert "[constraint]" in content
 
         # 索引文件也应被创建
         index = tmp_path / "memory" / "project_55" / "MEMORY.md"

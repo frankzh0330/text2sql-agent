@@ -8,6 +8,8 @@
 - 追加到一个文件（auto_learned.md），FIFO 淘汰
 - 写入前检查去重
 - 自动维护 MEMORY.md 索引
+- 只写 project 作用域的知识（correction / constraint）；个人习惯属于 user 作用域，
+  由 UserPreferenceStore 负责，不得写入 project memory 污染其他用户
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -24,6 +27,7 @@ from memory.judge_prompt import JUDGE_SYSTEM_PROMPT, JUDGE_TOOL_SCHEMA, JUDGE_US
 logger = logging.getLogger(__name__)
 
 _MAX_AUTO_LINES = 30  # auto_learned.md 最大行数
+_PROJECT_CATEGORIES = frozenset({"correction", "constraint"})
 
 
 class MemoryWriter:
@@ -31,6 +35,8 @@ class MemoryWriter:
 
     def __init__(self, data_path: str = "data/memory"):
         self.data_path = Path(data_path)
+        # 去重 → 追加 → 裁剪 是读改写序列，并发请求下需串行
+        self._write_lock = threading.Lock()
 
     async def maybe_save(
         self,
@@ -79,14 +85,15 @@ class MemoryWriter:
 
             if not content:
                 return
-
-            # 去重检查
-            if self._is_duplicate(project_dir, content):
-                logger.debug(f"Memory judge: duplicate, skip: {content[:50]}")
+            if category not in _PROJECT_CATEGORIES:
+                logger.debug(f"Memory judge: category={category} is not project-scoped, skip: {content[:50]}")
                 return
 
-            # 写入
-            self._append_memory(project_dir, category, content)
+            with self._write_lock:
+                if self._is_duplicate(project_dir, content):
+                    logger.debug(f"Memory judge: duplicate, skip: {content[:50]}")
+                    return
+                self._append_memory(project_dir, category, content)
             logger.info(f"Memory saved [{category}]: {content[:80]}")
 
         except Exception as e:

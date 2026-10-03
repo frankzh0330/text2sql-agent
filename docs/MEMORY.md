@@ -2,13 +2,13 @@
 title: "Memory Architecture"
 ---
 
-[Chinese version](https://github.com/frankzh0330/query-agent/blob/master/docs/MEMORY.zh-CN.md)
+[Chinese version](https://github.com/frankzh0330/text2sql-agent/blob/master/docs/MEMORY.zh-CN.md)
 
-This document explains the memory design in `query-agent`, why the project needs more than one kind of memory, and how the current implementation maps to that model.
+This document explains the memory design in `text2sql-agent`: why the project cannot treat “memory” as chat history alone, why it needs at least three kinds of memory, and how the current implementation maps to that model (read path, async write path, and the guardrails on each).
 
-## Why “Memory” Is Not One Thing Here
+## Why Memory Here Is Not a Single Layer
 
-For a data query agent, “memory” is not just chat history.
+For a Text2SQL data agent, “memory” is not just chat history.
 
 Different kinds of knowledge have different:
 
@@ -23,7 +23,10 @@ If these are mixed together, the system becomes less reliable:
 - user-specific habits may pollute other users
 - project-wide business rules may be mistaken for user preference
 
-That is why this project should not stop at “session memory + user memory”.
+That is why this project should not stop at:
+
+- session memory
+- user memory
 
 The more natural split is:
 
@@ -31,22 +34,63 @@ The more natural split is:
 - Project Memory
 - User Preference Signal
 
+## Overview
+
+| Kind | Scope | Lifetime | Trust | How it is written | Where it takes effect |
+|---|---|---|---|---|---|
+| Session Memory | session | short | high | synchronous JSONL write every turn | follow-up merge, filling omitted fields |
+| Project Memory | `_global` / project | long | high | hand-maintained + async LLM judge | Layer 1: injected into the extraction system prompt |
+| User Preference | project + user | medium to long | medium (weak signal) | synchronous counter increment after each success | Layer 2: weak bias after recall, before the decision |
+
+```mermaid
+flowchart TD
+    Q["User query"] --> ORC["QueryOrchestrator"]
+
+    subgraph READ["Read path (synchronous, main path)"]
+        S[("Session Memory<br/>data/sessions/*.jsonl")]
+        P[("Project Memory<br/>data/memory/_global + project_{id}")]
+        U[("User Preference<br/>data/user_preferences/*.json")]
+    end
+
+    ORC --> CTX["SessionManager.get_enhanced_context()"]
+    S --> CTX
+    P -->|"entry-level selection + truncation"| CTX
+    CTX -->|"=== known constraints and corrections ==="| L1["Layer 1 LLM intent extraction"]
+    L1 --> L2["Layer 2 Matcher recall"]
+    U -->|"bias ≤ +6, thresholds use raw score"| L2
+    L2 --> DEC{"accept / confirm / no match"}
+    DEC --> L3["Layer 3/4 SQL generation + validation"]
+    L3 --> OK["Successful response"]
+
+    subgraph WRITE["Write path (after success)"]
+        W1["add_message / update_query_state (sync)"]
+        W2["record_selection count +1 (sync)"]
+        W3["create_task(maybe_save) (async)"]
+    end
+
+    OK --> W1 --> S
+    OK --> W2 --> U
+    OK --> W3 --> J["LLM Judge<br/>correction / constraint"]
+    J -->|"should_save and not duplicate"| AL["auto_learned.md (FIFO, 30 lines)"] --> P
+```
+
 ## Layer 1: Session Memory
 
 ### What It Stores
 
-Session memory stores the short-lived state of the current conversation:
+Session memory stores short-lived state for the current conversation:
 
 - `last_query_state`
 - `pending_task_id`
-- recent messages
+- recent messages (last 20)
 - turn type metadata
 
 ### Where It Lives
 
-- [service/session_models.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_models.py)
-- [service/session_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_manager.py)
-- [service/task_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/task_manager.py)
+- [service/session_models.py](https://github.com/frankzh0330/text2sql-agent/blob/master/service/session_models.py)
+- [service/session_manager.py](https://github.com/frankzh0330/text2sql-agent/blob/master/service/session_manager.py)
+- [service/task_manager.py](https://github.com/frankzh0330/text2sql-agent/blob/master/service/task_manager.py)
+- [memory/storage/memory_file.py](https://github.com/frankzh0330/text2sql-agent/blob/master/memory/storage/memory_file.py): `JsonlStorage` is append-only with `fsync` and skips corrupted lines on read; compaction kicks in above 500 lines and keeps the latest 100. `TaskStorage` reuses the same base class, so confirmation tasks survive restarts.
 
 ### Why It Exists
 
@@ -58,137 +102,210 @@ Q2: Yesterday
 Q3: Change it to order count
 ```
 
-Without session memory, the agent would have to re-infer all fields every turn.
+Without session memory, the system would have to re-infer every field on every turn.
 
 ### Characteristics
 
 - scope: current session
 - lifetime: short
-- trust level: high
-- usage point: before / during turn resolution
+- trust: high
+- usage point: before and during turn resolution
 
 ## Layer 2: Project Memory
 
 ### What It Stores
 
-Project memory stores project-scoped business knowledge:
+Project memory stores project-level business knowledge:
 
 - default table/metric mappings
 - business constraints
-- domain corrections
+- correction rules
 - dimension/property caveats
 - project-specific interpretation rules
 
 Examples:
 
-- "In this project, "big orders" means orders with amount greater than 1000"
-- "The 'transaction table' in this project maps to orders" (a real auto-learned entry)
-- "Revenue queries should exclude canceled orders by default"
+- “In this project, "big orders" means orders with amount greater than 1000”
+- “In this project, '交易表' (transaction table) maps to the orders table” (a real auto-learned record)
+- “revenue excludes cancelled orders by default”
 
 ### Where It Lives
 
-- [memory/long_term_memory.py](https://github.com/frankzh0330/query-agent/blob/master/memory/long_term_memory.py)
-- runtime files under `data/memory/project_{id}/`
+- [memory/long_term_memory.py](https://github.com/frankzh0330/text2sql-agent/blob/master/memory/long_term_memory.py): loading and selection
+- [memory/memory_writer.py](https://github.com/frankzh0330/text2sql-agent/blob/master/memory/memory_writer.py) + [memory/judge_prompt.py](https://github.com/frankzh0330/text2sql-agent/blob/master/memory/judge_prompt.py): async auto-learning
+- runtime files:
+
+```text
+data/memory/
+  ├── _global/            # shared by all projects
+  │   ├── MEMORY.md       # index: - [title](file.md)
+  │   └── *.md
+  └── project_{id}/       # injected only for this project
+      ├── MEMORY.md
+      ├── *.md            # hand-maintained
+      └── auto_learned.md # written by MemoryWriter
+```
 
 ### Why It Exists
 
-This knowledge is:
+This kind of knowledge:
 
-- not temporary like session state
-- not personal like user habit
-- but essential for correct query interpretation
+- is not temporary session state
+- is not one user's personal habit
+- but is critical for query correctness
 
-This is especially important when real metadata is large, for example:
+It matters most in environments with large metadata, for example:
 
 - tens of thousands of tables and columns
 - many business aliases per column
-- overlapping natural-language expressions
+- heavily overlapping natural-language expressions
 
-In that environment, project semantics matter as much as raw matching.
+There, correctness depends on project semantics, not just string matching.
 
-### Current Implementation Detail
+### Read Path
 
-Project memory is loaded from `project_{id}/MEMORY.md`.
+```mermaid
+flowchart LR
+    A["load_memory_context(project_id, query_text, last_query_state)"] --> C{"entry cache hit and mtime unchanged?"}
+    C -->|yes| SEL
+    C -->|no| G["read _global/MEMORY.md + project_{id}/MEMORY.md"]
+    G --> IDX["read linked files, strip frontmatter<br/>split list-style files into entries"]
+    IDX --> SEL["_select_relevant_parts<br/>keyword hit count, top 5"]
+    SEL --> T["_truncate ≤ 50 lines / 5000 bytes"]
+    T --> INJ["context['memory_corrections']"]
+    INJ --> PR["llm_extractions.py<br/>system prompt, layer 1"]
+```
 
-The current implementation also does lightweight relevance selection:
+Details:
 
-- use current query text
-- optionally use fields from `last_query_state`
-- select a few more relevant memory fragments
-- avoid injecting every memory entry every turn
+- **Two-level buckets**: `_global/` applies to every project; `project_{id}/` applies only to that project.
+- **Entry granularity**: pure list files (such as `auto_learned.md`, one `- [category] ...` per line) are split into one entry per top-level list item; prose documents stay whole as a single entry.
+- **Per-query selection**: keywords = English tokens of the query + Chinese runs and their bigrams + tables / metrics / group_by / detail_columns from `last_query_state`. Entries are ranked by hit count and the top 5 are kept; if nothing matches, it conservatively falls back to the first 2 entries so context is not lost entirely.
+- **Cache**: only the raw entries read from disk are cached (key = project_id, invalidated by the newest `.md` mtime); selection is recomputed every turn from the current query.
+- **Injection point**: only affects Layer 1 intent extraction; the LLM still does not decide entity names.
+
+### Write Path (Async Auto-Learning)
+
+There are two triggers: a normal successful query, and a completed confirmation flow (which also passes `confirmed_selection`, the strongest correction signal).
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant W as MemoryWriter
+    participant L as LLM Judge
+    participant F as auto_learned.md
+
+    O->>O: return response to the user
+    O-)W: create_task(maybe_save(...)), not awaited
+    W->>F: read existing memory (context for the judge, avoid repeats)
+    W->>L: query + extraction + resolver_explain + current/prev state
+    Note over L: tool_choice forces judge_memory, temperature=0.1
+    L-->>W: {should_save, category, content}
+    alt should_save=false or category not project-scoped
+        W-->>W: stop
+    else correction / constraint
+        W->>W: under lock: per-line md5 + normalized substring dedup
+        W->>F: append "- [category] content"
+        W->>F: ensure MEMORY.md index lists auto_learned.md
+        W->>F: drop the oldest lines beyond 30 (FIFO)
+    end
+    Note over W: any exception is only logged as a warning, never breaks the main path
+```
+
+The judge only produces two kinds of project-level knowledge:
+
+- `correction`: the user rejected the system default (especially by picking a different value in the confirmation flow)
+- `constraint`: a project-specific rule, e.g. “purchase means payment_submit in this project”
+
+Personal habits (“I usually look at the last 30 days”) are **not written** to project memory: they would be injected for every user of the project, which is a scope leak. Even if the judge returns another category, `MemoryWriter` drops it. Ordinary high-confidence successful queries are not written either.
 
 ### Characteristics
 
-- scope: project
+- scope: `_global` / project
 - lifetime: long
-- trust level: high
-- usage point: prompt/context injection before extraction
+- trust: high
+- usage point: context injection before extraction
 
 ## Layer 3: User Preference Signal
 
 ### What It Stores
 
-User preference stores lightweight usage patterns such as:
+User preference stores lightweight usage habits (counts):
 
-- frequent tables
-- frequent metrics
-- frequent columns (including group-by columns)
+- frequently used tables
+- frequently used metrics
+- frequently used group-by dimensions
 
 Examples:
 
-- user A often checks `refund_rate`
+- user A often queries `refund_rate`
 - user A usually prefers `order_count`
 - user A often groups by `orders.channel`
 
 ### Where It Lives
 
-- [memory/user_preference_store.py](https://github.com/frankzh0330/query-agent/blob/master/memory/user_preference_store.py)
-- runtime files under `data/user_preferences/`
+- [memory/user_preference_store.py](https://github.com/frankzh0330/text2sql-agent/blob/master/memory/user_preference_store.py)
+- takes effect in: the `bias` argument of `resolve_with_candidates` in [matcher/matcher_service.py](https://github.com/frankzh0330/text2sql-agent/blob/master/matcher/matcher_service.py)
+- runtime files: `data/user_preferences/project_{id}__user_{uid}.json`
 
 ### Why It Exists
 
-Preference can improve ranking when multiple candidates are plausible.
+When several candidates all “look plausible”, a preference signal helps order them.
 
-But this is not the same as true project/business semantics.
+But it is not the same thing as project business semantics.
+
+### Mechanism
+
+```mermaid
+flowchart LR
+    M["EntityMatcher recall candidates<br/>score 0–100"] --> B["bias = min(6, 2·log2(count+1))<br/>keep raw_score"]
+    B --> S["re-sort by score"]
+    S --> D{"policy decision<br/>thresholds use raw_score<br/>ties use biased score"}
+    D -->|"top1 changed"| TAG["method gets +user_bias"]
+```
+
+- **Write**: after each success (including a completed confirmation), only the first table, the first metric, and the first 2 group_by columns are counted (+1); writes are locked and go through a temp file plus atomic replace.
+- **Bias curve**: 1 use → +2, 3 uses → +4, 7 or more → capped at +6.
+- **Explainability**: explain records `raw_score`, `preference_count`, and `preference_bias`.
 
 ### Very Important Constraint
 
-User preference is intentionally implemented as:
+In the current implementation, user preference is explicitly limited to:
 
-- post-recall rerank signal
+- a bounded weak bias (max +6) on candidates after recall, before the accept/confirm decision
+- the accept line and `CONFIRM_FLOOR` only look at the raw recall score: preference can break ties between candidates that already clear the bar, but cannot turn a low-confidence candidate into a silent accept on bias alone, nor pull a below-floor candidate into confirmation
 
-not as:
+It is not:
 
-- primary resolver
-- hard override
+- the primary resolver
+- a hard override rule
 
 That means:
 
-1. matcher still performs the main semantic recall
-2. preference only biases the top candidates
-3. scope is restricted to `project_id + user_id`
+1. the matcher still owns primary semantic recall
+2. preference only slightly reorders top candidates (including the order shown in confirmation)
+3. scope is strictly `project_id + user_id`
 
-This prevents overfitting to the user’s history.
+This avoids overfitting to user history, and it cuts the self-reinforcing loop of “preference causes a silent accept → count +1 → preference gets stronger”.
 
 ### Characteristics
 
 - scope: project + user
 - lifetime: medium to long
-- trust level: medium
-- usage point: after recall, before final candidate choice
+- trust: medium
+- usage point: after recall, before final selection
 
 ## Why User Preference Should Not Replace Matching
 
 Consider:
 
 ```text
-User history: often checks refund_rate
+User history: often queries refund_rate
 Current query: Show the cancellation rate
 ```
 
-If preference is too strong, the system may drift toward the user's habitual metric even though this turn asks for something else.
-
-That is why user preference must stay a weak signal.
+If preference were weighted too heavily, the system could be pulled toward a metric the user often uses but that is irrelevant this turn.
+So user preference must stay a weak signal.
 
 Good use:
 
@@ -196,8 +313,9 @@ Good use:
 
 Bad use:
 
-- globally bias every query before recall
-- overwrite a stronger semantic match
+- global bias before recall
+- overriding a clearly stronger semantic match
+- boosting a below-threshold candidate over the threshold
 
 ## Why Project Memory Is Different From User Preference
 
@@ -209,18 +327,19 @@ In this project, "big orders" means orders with amount greater than 1000
 
 This is not:
 
-- a temporary session fact
-- a personal user habit
+- temporary session information
+- one user's private habit
 
-It applies to everyone querying that project.
-
+It holds for anyone querying this project.
 So it belongs in project memory, not user preference.
 
-This is the key reason the architecture needs at least 3 memory categories, not 2.
+Conversely, “I usually look at the last 30 days” only holds for the person who said it, so MemoryWriter does not write it to project memory.
+
+That is why this project needs at least three kinds of memory, not two.
 
 ## Current Priority Order
 
-The intended priority order in the project is:
+The current priority order is:
 
 ```text
 explicit user input
@@ -229,55 +348,41 @@ explicit user input
   > user preference rerank
 ```
 
-Interpretation:
+Meaning:
 
-- explicit input is strongest
+- explicit user input is strongest
 - session state fills omitted fields
-- project memory constrains interpretation
-- user preference only nudges ranking
-
-## Current Runtime Flow
-
-```mermaid
-flowchart TD
-    Q["Incoming Query"] --> S["Session Memory"]
-    Q --> P["Project Memory Selection"]
-    Q --> U["User Preference Store"]
-    S --> C["Enhanced Context"]
-    P --> C
-    C --> L["LLM Extraction"]
-    L --> M["Matcher Recall"]
-    U --> R["Post-Recall Rerank Bias"]
-    M --> R
-    R --> T["Turn / Confirmation Logic"]
-```
+- project memory constrains the interpretation space
+- user preference only slightly affects ordering
 
 ## What Is Already Implemented
 
-Implemented now:
+Implemented today:
 
-- session persistence and recovery
+- session persistence and recovery (JSONL + compaction)
 - `last_query_state`
-- `pending_task_id`
-- project memory loading from `MEMORY.md`
-- relevant project memory snippet selection
-- user preference usage counts
-- user preference rerank scoped by `project_id + user_id`
+- `pending_task_id`, with confirmation tasks recovered across restarts
+- two-level project memory (`_global` + `project_{id}`) loaded via the `MEMORY.md` index
+- entry-level, per-query project memory selection (cache decoupled from selection)
+- async auto-learning via an LLM judge (correction / constraint only, dedup + FIFO)
+- user preference usage counts (locked + atomic write)
+- preference rerank scoped by `project_id + user_id`, with thresholds on raw score
 
 Not fully implemented yet:
 
 - richer `UserAlias`
 - richer `UserPattern`
-- richer `UserPreferences`
-- durable `QueryHistory`
-- explicit category-aware memory retrieval (`constraint > correction > preference`)
-- cross-session user memory beyond simple preference counts
+- richer `UserPreferences` (e.g. a stable default time range)
+- persisted `QueryHistory`
+- category-aware memory retrieval (e.g. `constraint > correction`)
+- cross-session user memory beyond simple counts
+- write mutual exclusion across processes (the current locks are per-process only)
 
 ## Why Short-Term QueryState Does Not Need AI Summarization
 
 Short-term query state is already structured.
 
-Example:
+For example:
 
 ```json
 {
@@ -289,53 +394,51 @@ Example:
 }
 ```
 
-This is already more precise than a text summary.
-
-So AI summarization is usually unnecessary for session memory.
+It is already more precise than a text summary.
+So for session memory, AI summarization is usually unnecessary.
 
 ## Where AI-Like Selection May Still Help Later
 
-Long-term memory is different:
+Long-term memory is different; it keeps growing:
 
-- many project rules
-- corrections
-- learned preferences
+- project rules
+- correction rules
 - caveats
 
-As this grows, the system may need smarter selection for:
+As it grows, the system may later need smarter selection for:
 
 - memory snippet choice
 - few-shot example choice
 - ambiguous explanation generation
 
-So “AI retrieval/summarization is unnecessary” is only true for short-term structured turn state, not for every memory problem in the project.
+So “AI retrieval/summarization does not apply” only holds for short-term structured turn state, not for memory as a whole.
 
 ## Recommended Next Steps
 
-1. Add category-aware project memory retrieval
-2. Introduce `UserAlias`, `UserPattern`, and `UserPreferences` separately from raw counts
-3. Add durable `QueryHistory` for replay, pattern aggregation, and failure analysis
-4. Consider a hybrid Markdown + embedding index for long-term project memory retrieval
-5. Expand eval cases for project memory and user preference behavior
-6. Add conflict-resolution policy when project memory and user preference disagree
+1. add category-aware project memory retrieval
+2. split `UserAlias`, `UserPattern`, and `UserPreferences` out of simple counts, to take over the personal preferences the judge no longer writes
+3. add persisted `QueryHistory` for replay, pattern aggregation, and failure analysis
+4. consider a hybrid Markdown + embedding index for long-term project memory retrieval
+5. add more project memory / user preference eval cases
+6. add a conflict policy for when project memory and user preference disagree
+7. move file writes to external storage or file locks for multi-process deployments
 
 ## User Memory Evolution
 
-The future user memory layer should be more structured than today's lightweight
-usage counters.
+Future user memory should not stop at the current lightweight usage counter.
 
 Recommended split:
 
-- `UserAlias`: explicit or learned aliases such as “orders” -> `orders` table
-- `UserPattern`: aggregated top tables, metrics, columns, and query frequency
-- `UserPreferences`: stable defaults such as preferred metric, table, or time range
-- `QueryHistory`: durable query traces for replay, evaluation, and pattern learning
+- `UserAlias`: explicit or learned aliases, e.g. “大单” (big orders) -> `orders.amount > 1000` filter
+- `UserPattern`: aggregated top tables, metrics, columns, query frequency
+- `UserPreferences`: stable defaults, e.g. preferred metric, table, time range
+- `QueryHistory`: persisted query traces for replay, evaluation, pattern learning
 
 Recommended storage:
 
-- PostgreSQL for durable user records and query history
-- Redis for hot per-user/project context
-- optional vector database for semantic recall over long-term memory and examples
+- PostgreSQL: persisted user records and query history
+- Redis: cache hot per-user/project context
+- optional Vector DB: semantic recall over long-term memory and examples
 
-Even with these additions, user memory should remain weaker than explicit input,
-session state, and project memory.
+Even with these capabilities, user memory should stay weaker than explicit input, session state, and
+project memory.

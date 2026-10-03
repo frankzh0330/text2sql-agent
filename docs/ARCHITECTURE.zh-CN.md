@@ -2,7 +2,7 @@
 
 [English](ARCHITECTURE.md) | [简体中文](ARCHITECTURE.zh-CN.md)
 
-本文总结 `query-agent` 当前的真实架构、各主要模块的职责，以及层间依赖方向。
+本文总结 `text2sql-agent` 当前的真实架构、各主要模块的职责，以及层间依赖方向。
 
 ## 分层视图
 
@@ -20,9 +20,9 @@
 │   task_manager.py · followup_resolver.py                    │
 │   query_state_merger.py                                     │
 ├──────────────────────────────────────────────────────────────┤
-│                       NL2SQL Pipeline                       │
+│                      Text2SQL Pipeline                      │
 │   llm_extractions.py                                        │
-│   matcher_service.py + table/column/metric matchers         │
+│   matcher_service.py + entity_matcher.py + policy.py        │
 │   reranker.py（可选）                                       │
 │   sql_generator.py · sql_validator.py · sql_ast_analyzer.py │
 ├──────────────────────────────────────────────────────────────┤
@@ -104,7 +104,7 @@ flowchart TD
     DISP --> TG
 ```
 
-## NL2SQL Pipeline
+## Text2SQL Pipeline
 
 ### Layer 1：LLM Extraction
 
@@ -129,26 +129,45 @@ flowchart TD
 
 ### Layer 2：Matcher Resolution
 
-主要文件：[matcher/matcher_service.py](../matcher/matcher_service.py) 及具体 matcher
-（[table_matcher.py](../matcher/table_matcher.py)、[column_matcher.py](../matcher/column_matcher.py)、
-[sql_metric_matcher.py](../matcher/sql_metric_matcher.py)、[time_matcher.py](../matcher/time_matcher.py)），
-全部构建在 [matcher/base.py](../matcher/base.py)（IDF 加权倒排索引 + edit-distance typo 探测 + RapidFuzz 重排 + 同义词）之上，
-元数据来自 [matcher/schema_loader.py](../matcher/schema_loader.py)。
+主要文件：[matcher/matcher_service.py](../matcher/matcher_service.py)（判定 + 主表/join 推断）、
+[matcher/entity_matcher.py](../matcher/entity_matcher.py)（表/列/指标共用的 `EntityMatcher`）、
+[matcher/policy.py](../matcher/policy.py)（全部阈值）、[time_matcher.py](../matcher/time_matcher.py)，
+元数据来自 [matcher/schema_loader.py](../matcher/schema_loader.py) 合并后的 `SQLSchema`。
+
+```mermaid
+flowchart TD
+    Q["L1 片段"] --> EX{{"exact 别名？"}}
+    EX -->|唯一实体| C["候选"]
+    EX -->|多个实体| COL["exact_alias_collision"]
+    EX -->|否| R["Retrievers（候选取并集）<br/>LexicalRetriever：IDF 倒排<br/>+ 复数归一 + typo 探测"]
+    R --> S["打分 = max(别名相似度 × 别名置信度)"]
+    S --> C
+    C --> B["用户偏好弱加权（≤ +6）"]
+    COL --> B
+    B --> D{{"判定 — matcher/policy.py"}}
+    D -->|冲突：两路列 + 有基表| JD["join 距离唯一最近者"]
+    D -->|"≥ 采纳线且不并列"| ACC["采纳"]
+    D -->|"[40, 采纳线) / 并列 / 冲突无法消歧"| CONF["确认 → 可选 LLM 重排"]
+    D -->|"< 40"| NM["no_match"]
+```
 
 职责：
 
 - 解析 `table / table.column / metric_id / time_range`，带分数与候选
-- 阈值策略（确定性，不依赖 LLM），按实体类型校准：metric ≥ 90 直接用（指标错则数字全错），table/column ≥ 80；确认带内触发用户确认，< 40 丢弃/回退；并列守卫在 top1/top2 分差 <10 时即使过线也进确认
-- 召回为 IDF 加权（BM25-lite）：命中数打平时判别性 token 胜过泛化 token（table/amount/id）；零命中且 ≥4 字符的 token 做 edit-distance-1 词表探测（'orde tablez' -> orders），权重 0.75 折
-- exact 别名冲突（同一别名挂多个实体，如 amount 在 orders/payments、time 在三张表）建索引时检测、查询时暴露：两路列冲突且有基表上下文时按 join 图距离确定性消歧（orders 语境下 region -> users.region）；3 路超泛化词或距离并列升级确认流并给出全部候选——绝不静默 first-wins
+- 候选生成（`EntityMatcher`）：query 与别名都先做单复数折叠（`product categories` ≡ `product category`，`-ies` → `-y`，`-ss/-us/-is` 不动），在折叠后的 key 上做 exact 与打分；exact 别名命中直接短路；否则每个 `Retriever` 召回 top-k 实体名，取并集后打分。默认 `LexicalRetriever` 为 IDF 加权（BM25-lite），判别性 token 胜过泛化 token（table/amount/id），召回 token 同样做复数归一（`customers` -> `customer`），零命中且 ≥4 字符的 token 做 edit-distance-1 词表探测（'orde tablez' -> orders），权重 0.75 折
+- 打分：`max(别名相似度 × 别名置信度)`，置信度来自别名来源（curated 1.0 … llm 0.5）。只有 query 不短于别名时才允许 WRatio 子串匹配，短 query 不能靠长别名的前缀胜出（`customer` 对 `customer reviews` 得 67 分，对 `customers` 得 94 分）
+- 唯一的判定函数（`resolve_with_candidates`），固定顺序：偏好加权 → 冲突处理 → 分档，阈值全部在 `matcher/policy.py`：metric ≥ 90 直接用（指标错则数字全错），table/column ≥ 80；[40, 采纳线) 触发用户确认，< 40 视为无匹配；并列守卫在 top1/top2 分差 <10 时即使过线也进确认
+- exact 别名冲突（同一别名挂多个实体，如 amount 在 orders/payments、time 在三张表）查询时暴露、绝不静默 first-wins：两路列冲突且有基表上下文时按 join 图距离确定性消歧（orders 语境下 region -> users.region）；3 路超泛化词或距离并列升级确认流并给出全部候选
+- 列（group-by / 明细 / window 分组）遵守同一判定：需确认的列升级确认流，不再静默取召回 top1
 - 用户不提表名时推断主表（从指标表达式或列归属投票）
-- 从声明式 `joins:` 配置推断 join 步骤；路径缺失升级为确认流
+- 从语义层声明的 join 图推断 join 步骤；路径缺失升级为确认流
 
 重要细节：
 
-- user preference 只在 recall 后做小幅 rerank
-- 可选的受限 LLM 重排（[service/reranker.py](../service/reranker.py)，`RERANKER_ENABLED=true`）只在低置信带触发：只能对已有候选重排、不得发明新值，明确胜出（relevance ≥ 85 且 margin ≥ 15）才静默采纳
+- user preference 是有上限的候选弱加权，在采纳/确认判定**之前**生效；可打破并列或调整候选顺序，改变 top1 时 `method` 标注 `+user_bias`
+- 可选的受限 LLM 重排（[service/reranker.py](../service/reranker.py)，`RERANKER_ENABLED=true`）只在判定落入确认带时触发：只能对已有候选重排、不得发明新值，明确胜出（relevance ≥ 85 且 margin ≥ 15）才静默采纳；生产可在同一接口后换成本地 cross-encoder 模型（如 bge-reranker-v2-m3）
 - matcher 本身仍然是主要语义解析器
+- 召回可插拔：加 embedding `Retriever` 不需要改打分和判定策略（见 [Schema 与 Metadata](#schema-与-metadata)）
 
 ### Layer 3：SQL Generation
 
@@ -173,9 +192,9 @@ flowchart TD
 - 单条只读语句（仅 SELECT / WITH）
 - 所有表引用必须在 schema 白名单内
 - 默认 LIMIT 注入
-- AST 分析：列存在性（别名解析后）、join 边与 ON 键必须与声明的 `joins:` 一致、JOIN 缺 ON 报错
+- AST 分析：列存在性（sqlglot 别名解析后）、join 边与 ON 键必须与语义层声明的 join 图一致、JOIN 缺 ON 报错
 - 实体保真（对抗语义漂移）：已解析的表、指标表达式、过滤谓词必须出现在 SQL 中
-- 静态成本警告（扫描量估算、事实表无条件全表扫描、join 深度），只写入 explain
+- 静态成本警告（按 catalog 行数估算扫描量、事实表无条件全表扫描、join 深度），只写入 explain（`explain.resolver_explain.sql_generation.ast_analysis`）
 - 分析错误与校验错误一样回灌修复循环；警告不阻断
 - 确定性护栏，独立于 LLM
 
@@ -206,7 +225,7 @@ Turn-based 行为是系统的一等公民，不是简单的 prompt 技巧。
 ```mermaid
 flowchart TD
     Q["Incoming text"] --> D["detect_followup()"]
-    D -->|new_query| N["Run full NL2SQL path"]
+    D -->|new_query| N["Run full Text2SQL path"]
     D -->|followup_patch| P["Extract patch"]
     P --> M["merge_query_state()"]
     M --> S["SQL Generation"]
@@ -266,7 +285,7 @@ Q6: Top 3 per region
 重要细节：
 
 - memory 从 `project_{id}/MEMORY.md` 加载
-- 会结合当前 query text 选择更相关的 memory 片段
+- 列表型文件（如 `auto_learned.md`）按条目拆分，每轮按当前 query 关键词重新选择相关条目
 - 不再需要每轮都注入整份项目 memory
 
 ### 3. User Preference Signal
@@ -280,7 +299,8 @@ Q6: Top 3 per region
 
 作用：
 
-- 在 recall 后对 top candidates 做 rerank
+- 在 recall 之后、采纳/确认判定之前对候选做有上限的弱加权（≤ +6）
+- 阈值只看召回原始分：偏好只能在都过线的候选间打破并列，不能把低置信候选推成静默采纳
 - 绝不替代 matcher 主语义判断
 - 保持为弱信号，而不是主解析器
 
@@ -322,7 +342,7 @@ Session 和 Task 分开持久化：
 职责：
 
 - 异步判断某次成功查询是否值得沉淀为长期记忆
-- 将学习结果追加到项目级 memory 文件
+- 将学习结果追加到项目级 memory 文件（只写 `correction` / `constraint`；个人偏好不进 project memory）
 - 自动维护 `MEMORY.md` 索引
 
 它是一个 sidecar 行为：
@@ -491,7 +511,7 @@ Current query:
 预期行为：
 
 - matcher recall 仍然先产生候选集
-- user preference 只在 recall 后生效
+- user preference 在 recall 之后、判定之前生效
 - preference 可以轻微提升 `order_count`
 - preference 不能覆盖更强的显式语义匹配
 
@@ -550,16 +570,42 @@ LLM 输出每次会有波动，所以结果只是一次采样，不是稳定的�
 
 ## Schema 与 Metadata
 
-仓库里的 [catalog/sql_schema.yaml](../catalog/sql_schema.yaml) 是 demo/development 态输入
-（表/列/指标别名 + 声明式 join + 指标口径表达式）。别名只有英文，demo 查询需要用英文提问。
+元数据按企业里的真实分工拆分：仓库里每个文件模拟一个独立维护的系统，由
+[matcher/schema_loader.py](../matcher/schema_loader.py) 中各自的 source adapter 读取，合并为内存中的
+`SQLSchema`，跨文件引用在加载时校验（fail fast）。
+
+| 文件 | 模拟 | 内容 |
+|------|------|------|
+| [catalog/tables.yaml](../catalog/tables.yaml) | 物理 catalog（Unity Catalog / DataHub / OpenMetadata / `INFORMATION_SCHEMA`），机器维护 | 表、列、类型、注释、owner、行数、低基数列的 profiling 枚举值 |
+| [catalog/metrics.yaml](../catalog/metrics.yaml) | 语义层（LookML） | 受治理的指标定义、join 图、各 view 的默认时间维度 |
+| [catalog/aliases.yaml](../catalog/aliases.yaml) | alias 表 | `(entity_id, alias, source, confidence, status, updated_by)` 行 |
+
+别名来源与默认置信度（单行可覆盖）：
+
+| 来源 | 置信度 | 说明 |
+|------|--------|------|
+| curated | 1.0 | 人工维护、git review（核心指标和口径） |
+| glossary | 0.9 | catalog business glossary 术语绑定到列或指标 |
+| comment | 0.7 | 从 catalog 列注释派生 |
+| query_log | 0.6 | 从历史 SQL + 工单/问题文本挖掘 |
+| feedback | 0.6 | 确认流里用户的选择，累积后升级 |
+| llm | 0.5 | 根据名称、注释、样例值离线生成，初始为 `pending` |
+
+`pending` 行审核前不进索引。每个实体的规范名总是置信度 1.0 的别名。置信度与匹配分相乘，所以命中
+0.6 置信度的别名即使 exact 也只有 60 分，走确认流而不是自动采纳。demo 别名只有英文，demo 查询需要用英文提问。
 
 更接近生产的方向是：
 
-- 表/列/指标 metadata 从公司 metadata service（或 INFORMATION_SCHEMA）定时同步
+- 各 source adapter 换成真实客户端（表走 Unity Catalog REST，指标与 join 走 LookML / dbt 语义层 API，
+  别名走 alias DB 表），定时同步
 - 同步后调用 `load_sql_schema()` 热重建 matcher 索引
-- 当前未实现同步调度器：demo 态 schema 在 server 启动时一次性加载（`server.py` lifespan），
+- 当前未实现同步调度器：demo 态 catalog 在 server 启动时一次性加载（`server.py` lifespan），
   更新 YAML 需重启进程；热重建接缝已就绪（`load_sql_schema()` → 重建 `MatcherService` →
   `set_matcher_service()` 热替换）
+- 语义召回：`EntityMatcher(entities, retrievers=[...])` 对所有 `Retriever`
+  （`retrieve(query, k) -> (names, explain)`）的候选取并集，打分与判定策略不变。接入 embedding 召回：
+  离线把每个实体的别名 + 注释/描述向量化建索引，实现一个对 query 做 embedding 并返回 top-k 实体名的
+  `Retriever`，与 `LexicalRetriever` 一起传入
 - 查询执行（只读账号、超时、成本上限）与结果渲染属于下游层，不在本 Demo 范围
 
 这一点重要，因为真实环境可能会有：
@@ -578,7 +624,7 @@ LLM 只负责摘录用户原话，所以抽出来的值（`credit card`）和库
 
 - **列**：[orchestrator](../service/query_orchestrator.py) 只接受高置信匹配（score >= 80）的过滤列。低置信或未匹配的列不再从召回列表里取 top1 去猜，
   而是返回 `early_exit` 并列出相近的列，让用户换个说法。（此前被捏造出的 `user_type` 会被模糊匹配成 `orders.user_id`。）
-- **值**：列可以在 [catalog/sql_schema.yaml](../catalog/sql_schema.yaml) 中声明 `enum_values`。
+- **值**：列可以在 [catalog/tables.yaml](../catalog/tables.yaml) 中带 profiling 得到的 `distinct_values`（加载为 `enum_values`）。
   `SQLSchema.normalize_enum_value()` 用确定性规则把抽出的值映射成声明值：精确匹配，其次忽略大小写/空格/连字符
   （`Credit-Card` -> `credit_card`），再其次 RapidFuzz >= 90（`cancelled` -> `canceled`）。完全匹配不上的值原样透传，
   并记录在 `explain` 中，不阻断查询。
@@ -603,7 +649,7 @@ LLM 只负责摘录用户原话，所以抽出来的值（`credit card`）和库
 
 ### 本项目的演进方向
 
-把手写的 `enum_values` 换成从数仓同步的取值（每个符合条件的列取 distinct/top-K，与 metadata 同步使用同一个刷新周期），
+把 `tables.yaml` 里模拟的 `distinct_values` 换成从数仓同步的取值（每个符合条件的列取 distinct/top-K，与 metadata 同步使用同一个刷新周期），
 保留 `normalize_enum_value()` 作为确定性的第一道处理，对高基数列再加 embedding 或 LSH 取值索引。
 有歧义或匹配不上的值应走确认流，而不是原样透传。
 
@@ -632,7 +678,7 @@ LLM 只负责摘录用户原话，所以抽出来的值（`credit card`）和库
 用户历史不能替代 resolver，只能在受控位置发挥作用：
 
 - LLM extraction 前：注入选出的 alias、default、personalized few-shot examples
-- matcher recall 后：用 user pattern 做弱 rerank bias
+- matcher recall 之后、采纳/确认判定之前：用 user pattern 做有上限的弱加权
 - 查询成功后：异步保存 query history，并更新聚合 pattern
 
 ### 未来数据模型

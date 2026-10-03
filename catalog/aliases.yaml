@@ -1,0 +1,213 @@
+# ============================================================
+# Alias table (business names -> catalog entities)
+#
+# One row per (entity_id, alias). In production this is a DB table fed by several
+# sources, each with a default confidence (overridable per row):
+#
+#   source      confidence  origin
+#   curated     1.0         hand-written, git reviewed (core metrics / definitions)
+#   glossary    0.9         catalog business glossary term bound to a column/metric
+#   comment     0.7         derived from catalog column comments
+#   query_log   0.6         mined from historical SQL + ticket / question text
+#   llm         0.5         generated offline from names/comments/samples; starts `pending`
+#   feedback    0.6         user picks in the confirmation flow; promoted after accumulating
+#
+#   status: approved (default) | pending — pending rows are not indexed until reviewed
+#   entity_id: table:<t> | column:<t>.<c> | metric:<m>
+#   The canonical table/column/metric name is always an alias; it is added by the
+#   loader and not listed here.
+#
+# Ambiguous aliases on purpose ("amount", "time", "status", "region") so that the
+# confirmation / rerank flow has something to do.
+# ============================================================
+aliases:
+  # --- table orders
+  - {entity_id: "table:orders", alias: "order table", source: curated}
+  - {entity_id: "table:orders", alias: "order records", source: curated}
+  - {entity_id: "table:orders", alias: "purchases", source: curated}
+  - {entity_id: "table:orders", alias: "transactions", source: curated}
+  # --- table users
+  - {entity_id: "table:users", alias: "user table", source: curated}
+  - {entity_id: "table:users", alias: "customers", source: curated}
+  - {entity_id: "table:users", alias: "members", source: curated}
+  - {entity_id: "table:users", alias: "buyers", source: curated}
+  # --- table products
+  - {entity_id: "table:products", alias: "product table", source: curated}
+  - {entity_id: "table:products", alias: "items", source: curated}
+  - {entity_id: "table:products", alias: "catalog items", source: curated}
+  - {entity_id: "table:products", alias: "goods", source: curated}
+  # --- table payments
+  - {entity_id: "table:payments", alias: "payment table", source: curated}
+  - {entity_id: "table:payments", alias: "payment records", source: curated}
+  - {entity_id: "table:payments", alias: "transactions log", source: curated}
+  # --- table reviews
+  - {entity_id: "table:reviews", alias: "review table", source: curated}
+  - {entity_id: "table:reviews", alias: "ratings", source: curated}
+  - {entity_id: "table:reviews", alias: "feedback", source: curated}
+  - {entity_id: "table:reviews", alias: "customer reviews", source: curated}
+  # --- table sellers
+  - {entity_id: "table:sellers", alias: "seller table", source: curated}
+  - {entity_id: "table:sellers", alias: "merchants", source: curated}
+  - {entity_id: "table:sellers", alias: "vendors", source: curated}
+  - {entity_id: "table:sellers", alias: "shops", source: curated}
+  # --- columns of orders
+  - {entity_id: "column:orders.order_id", alias: "order id", source: curated}
+  - {entity_id: "column:orders.order_id", alias: "order number", source: curated}
+  - {entity_id: "column:orders.order_id", alias: "order no", source: curated}
+  - {entity_id: "column:orders.user_id", alias: "user id", source: curated}
+  - {entity_id: "column:orders.user_id", alias: "customer id", source: curated}
+  - {entity_id: "column:orders.user_id", alias: "buyer id", source: curated}
+  - {entity_id: "column:orders.product_id", alias: "product id", source: curated}
+  - {entity_id: "column:orders.product_id", alias: "item id", source: curated}
+  - {entity_id: "column:orders.product_id", alias: "sku", source: curated}
+  - {entity_id: "column:orders.amount", alias: "order amount", source: curated}
+  - {entity_id: "column:orders.amount", alias: "order value", source: curated}
+  - {entity_id: "column:orders.amount", alias: "total", source: curated}
+  - {entity_id: "column:orders.freight", alias: "shipping fee", source: curated}
+  - {entity_id: "column:orders.freight", alias: "shipping cost", source: curated}
+  - {entity_id: "column:orders.freight", alias: "delivery fee", source: curated}
+  - {entity_id: "column:orders.status", alias: "order status", source: curated}
+  - {entity_id: "column:orders.status", alias: "state", source: curated}
+  - {entity_id: "column:orders.channel", alias: "traffic source", source: curated}
+  - {entity_id: "column:orders.channel", alias: "acquisition channel", source: curated}
+  - {entity_id: "column:orders.channel", alias: "source", source: curated}
+  - {entity_id: "column:orders.created_at", alias: "order time", source: curated}
+  - {entity_id: "column:orders.created_at", alias: "order date", source: curated}
+  - {entity_id: "column:orders.created_at", alias: "created time", source: curated}
+  - {entity_id: "column:orders.created_at", alias: "time", source: curated}
+  - {entity_id: "column:orders.created_at", alias: "date", source: curated}
+  # --- columns of users
+  - {entity_id: "column:users.id", alias: "user id", source: curated}
+  - {entity_id: "column:users.id", alias: "customer id", source: curated}
+  - {entity_id: "column:users.region", alias: "area", source: curated}
+  - {entity_id: "column:users.region", alias: "country", source: curated}
+  - {entity_id: "column:users.region", alias: "location", source: curated}
+  - {entity_id: "column:users.city", alias: "town", source: curated}
+  - {entity_id: "column:users.vip_level", alias: "vip level", source: curated}
+  - {entity_id: "column:users.vip_level", alias: "membership level", source: curated}
+  - {entity_id: "column:users.vip_level", alias: "member tier", source: curated}
+  - {entity_id: "column:users.vip_level", alias: "loyalty tier", source: curated}
+  - {entity_id: "column:users.vip_level", alias: "tier", source: curated}
+  - {entity_id: "column:users.registered_at", alias: "registration time", source: curated}
+  - {entity_id: "column:users.registered_at", alias: "signup date", source: curated}
+  - {entity_id: "column:users.registered_at", alias: "registered time", source: curated}
+  - {entity_id: "column:users.registered_at", alias: "signup time", source: curated}
+  # --- columns of products
+  - {entity_id: "column:products.id", alias: "product id", source: curated}
+  - {entity_id: "column:products.id", alias: "item id", source: curated}
+  - {entity_id: "column:products.category", alias: "product category", source: curated}
+  - {entity_id: "column:products.category", alias: "product type", source: curated}
+  - {entity_id: "column:products.category", alias: "department", source: curated}
+  - {entity_id: "column:products.brand", alias: "manufacturer", source: curated}
+  - {entity_id: "column:products.price", alias: "unit price", source: curated}
+  - {entity_id: "column:products.price", alias: "list price", source: curated}
+  - {entity_id: "column:products.price", alias: "selling price", source: curated}
+  - {entity_id: "column:products.seller_id", alias: "seller id", source: curated}
+  - {entity_id: "column:products.seller_id", alias: "merchant id", source: curated}
+  - {entity_id: "column:products.seller_id", alias: "vendor id", source: curated}
+  # --- columns of payments
+  - {entity_id: "column:payments.payment_id", alias: "payment id", source: curated}
+  - {entity_id: "column:payments.order_id", alias: "order id", source: curated}
+  - {entity_id: "column:payments.order_id", alias: "order number", source: curated}
+  - {entity_id: "column:payments.payment_type", alias: "payment type", source: curated}
+  - {entity_id: "column:payments.payment_type", alias: "payment method", source: curated}
+  - {entity_id: "column:payments.payment_type", alias: "payment mode", source: curated}
+  - {entity_id: "column:payments.payment_type", alias: "pay method", source: curated}
+  - {entity_id: "column:payments.amount", alias: "payment amount", source: curated}
+  - {entity_id: "column:payments.amount", alias: "paid amount", source: curated}
+  - {entity_id: "column:payments.amount", alias: "paid value", source: curated}
+  - {entity_id: "column:payments.installments", alias: "instalments", source: curated}
+  - {entity_id: "column:payments.installments", alias: "number of installments", source: curated}
+  - {entity_id: "column:payments.paid_at", alias: "payment time", source: curated}
+  - {entity_id: "column:payments.paid_at", alias: "paid time", source: curated}
+  - {entity_id: "column:payments.paid_at", alias: "payment date", source: curated}
+  - {entity_id: "column:payments.paid_at", alias: "time", source: curated}
+  - {entity_id: "column:payments.paid_at", alias: "date", source: curated}
+  # --- columns of reviews
+  - {entity_id: "column:reviews.review_id", alias: "review id", source: curated}
+  - {entity_id: "column:reviews.order_id", alias: "order id", source: curated}
+  - {entity_id: "column:reviews.order_id", alias: "order number", source: curated}
+  - {entity_id: "column:reviews.rating", alias: "score", source: curated}
+  - {entity_id: "column:reviews.rating", alias: "stars", source: curated}
+  - {entity_id: "column:reviews.rating", alias: "review score", source: curated}
+  - {entity_id: "column:reviews.created_at", alias: "review time", source: curated}
+  - {entity_id: "column:reviews.created_at", alias: "review date", source: curated}
+  - {entity_id: "column:reviews.created_at", alias: "time", source: curated}
+  - {entity_id: "column:reviews.created_at", alias: "date", source: curated}
+  # --- columns of sellers
+  - {entity_id: "column:sellers.id", alias: "seller id", source: curated}
+  - {entity_id: "column:sellers.id", alias: "merchant id", source: curated}
+  - {entity_id: "column:sellers.region", alias: "seller region", source: curated}
+  - {entity_id: "column:sellers.region", alias: "merchant region", source: curated}
+  - {entity_id: "column:sellers.region", alias: "seller location", source: curated}
+  - {entity_id: "column:sellers.joined_at", alias: "seller join date", source: curated}
+  - {entity_id: "column:sellers.joined_at", alias: "onboarding date", source: curated}
+  # --- metrics
+  - {entity_id: "metric:revenue", alias: "sales", source: curated}
+  - {entity_id: "metric:revenue", alias: "gmv", source: curated}
+  - {entity_id: "metric:revenue", alias: "sales amount", source: curated}
+  - {entity_id: "metric:revenue", alias: "turnover", source: curated}
+  - {entity_id: "metric:revenue", alias: "gross merchandise value", source: curated}
+  - {entity_id: "metric:order_count", alias: "order count", source: curated}
+  - {entity_id: "metric:order_count", alias: "number of orders", source: curated}
+  - {entity_id: "metric:order_count", alias: "orders count", source: curated}
+  - {entity_id: "metric:order_count", alias: "order volume", source: curated}
+  - {entity_id: "metric:order_count", alias: "total orders", source: curated}
+  # 裸实体名作指标 = 计数（"How many orders" / "Orders in the past 14 days"）；表 matcher 独立，不冲突
+  - {entity_id: "metric:order_count", alias: "orders", source: curated}
+  - {entity_id: "metric:avg_order_value", alias: "average order value", source: curated}
+  - {entity_id: "metric:avg_order_value", alias: "aov", source: curated}
+  - {entity_id: "metric:avg_order_value", alias: "avg order value", source: curated}
+  - {entity_id: "metric:avg_order_value", alias: "average order amount", source: curated}
+  - {entity_id: "metric:avg_order_value", alias: "average basket", source: curated}
+  - {entity_id: "metric:buyer_count", alias: "buyer count", source: curated}
+  - {entity_id: "metric:buyer_count", alias: "number of buyers", source: curated}
+  - {entity_id: "metric:buyer_count", alias: "unique buyers", source: curated}
+  - {entity_id: "metric:buyer_count", alias: "paying users", source: curated}
+  - {entity_id: "metric:buyer_count", alias: "customers who ordered", source: curated}
+  - {entity_id: "metric:cancel_rate", alias: "cancel rate", source: curated}
+  - {entity_id: "metric:cancel_rate", alias: "cancellation rate", source: curated}
+  - {entity_id: "metric:cancel_rate", alias: "canceled order rate", source: curated}
+  - {entity_id: "metric:cancel_rate", alias: "order cancel ratio", source: curated}
+  - {entity_id: "metric:refund_rate", alias: "refund rate", source: curated}
+  - {entity_id: "metric:refund_rate", alias: "refunded order rate", source: curated}
+  - {entity_id: "metric:refund_rate", alias: "return rate", source: curated}
+  - {entity_id: "metric:refund_rate", alias: "order refund ratio", source: curated}
+  - {entity_id: "metric:avg_freight", alias: "average freight", source: curated}
+  - {entity_id: "metric:avg_freight", alias: "avg shipping fee", source: curated}
+  - {entity_id: "metric:avg_freight", alias: "average shipping cost", source: curated}
+  - {entity_id: "metric:avg_freight", alias: "average delivery fee", source: curated}
+  - {entity_id: "metric:products_sold", alias: "products sold", source: curated}
+  - {entity_id: "metric:products_sold", alias: "number of products sold", source: curated}
+  - {entity_id: "metric:products_sold", alias: "distinct products ordered", source: curated}
+  - {entity_id: "metric:products_sold", alias: "active products", source: curated}
+  - {entity_id: "metric:payment_amount", alias: "payment amount", source: curated}
+  - {entity_id: "metric:payment_amount", alias: "total payments", source: curated}
+  - {entity_id: "metric:payment_amount", alias: "paid amount", source: curated}
+  - {entity_id: "metric:payment_amount", alias: "amount paid", source: curated}
+  - {entity_id: "metric:payment_amount", alias: "payment volume", source: curated}
+  - {entity_id: "metric:avg_installments", alias: "average installments", source: curated}
+  - {entity_id: "metric:avg_installments", alias: "avg installments", source: curated}
+  - {entity_id: "metric:avg_installments", alias: "average number of installments", source: curated}
+  - {entity_id: "metric:avg_rating", alias: "average rating", source: curated}
+  - {entity_id: "metric:avg_rating", alias: "avg rating", source: curated}
+  - {entity_id: "metric:avg_rating", alias: "average review score", source: curated}
+  - {entity_id: "metric:avg_rating", alias: "mean rating", source: curated}
+  - {entity_id: "metric:avg_rating", alias: "average stars", source: curated}
+  - {entity_id: "metric:review_count", alias: "review count", source: curated}
+  - {entity_id: "metric:review_count", alias: "number of reviews", source: curated}
+  - {entity_id: "metric:review_count", alias: "total reviews", source: curated}
+  - {entity_id: "metric:review_count", alias: "reviews received", source: curated}
+  - {entity_id: "metric:positive_review_rate", alias: "positive review rate", source: curated}
+  - {entity_id: "metric:positive_review_rate", alias: "good review rate", source: curated}
+  - {entity_id: "metric:positive_review_rate", alias: "satisfaction rate", source: curated}
+  - {entity_id: "metric:positive_review_rate", alias: "share of positive reviews", source: curated}
+  - {entity_id: "metric:new_user_count", alias: "new users", source: curated}
+  - {entity_id: "metric:new_user_count", alias: "new user count", source: curated}
+  - {entity_id: "metric:new_user_count", alias: "signups", source: curated}
+  - {entity_id: "metric:new_user_count", alias: "new registrations", source: curated}
+  - {entity_id: "metric:new_user_count", alias: "number of signups", source: curated}
+  # --- non-curated sources (confidence < 1.0 scales the match score)
+  - {entity_id: "metric:avg_order_value", alias: "basket size", source: glossary, updated_by: datahub-sync}
+  - {entity_id: "metric:revenue", alias: "income", source: query_log, updated_by: alias-miner}       # 60 → confirmation, never auto-accepted
+  - {entity_id: "column:products.brand", alias: "label", source: llm, status: pending, updated_by: alias-gen}  # not indexed until reviewed

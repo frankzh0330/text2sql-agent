@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import List, Optional
 
 import jieba
 
@@ -43,7 +43,7 @@ def normalize(text: str) -> str:
     return text
 
 
-def tokenize_mixed(text: str, max_tokens: int = 5) -> List[str]:
+def tokenize_mixed(text: str, max_tokens: Optional[int] = 5) -> List[str]:
     """
     中英混合分词：
     - 英文 / 数字 / 下划线块：按 _ 和空格拆
@@ -51,9 +51,12 @@ def tokenize_mixed(text: str, max_tokens: int = 5) -> List[str]:
 
     Args:
         text: 待分词文本
-        max_tokens: 最多返回多少个 token，默认 5
+        max_tokens: 最多返回多少个 token，默认 5；None 表示不截断
+                    （需要先过滤停用词再截断的调用方传 None，自行截断）
     """
-    norm_text = text.strip().lower()
+    # 先 normalize 再切块：normalize 在 lower 之前拆 camelCase（shippingFee -> shipping fee），
+    # 直接 lower 会把大小写边界抹掉
+    norm_text = normalize(text)
     if not norm_text:
         return []
 
@@ -78,7 +81,7 @@ def tokenize_mixed(text: str, max_tokens: int = 5) -> List[str]:
     tokens = list(dict.fromkeys(tokens))  # 去重保序
 
     # 限制 token 数量
-    if len(tokens) > max_tokens:
+    if max_tokens is not None and len(tokens) > max_tokens:
         tokens = tokens[:max_tokens]
 
     return tokens

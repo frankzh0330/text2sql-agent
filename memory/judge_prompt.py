@@ -1,7 +1,8 @@
 """Memory Judge — LLM 判断是否需要写入记忆的 prompt"""
 from __future__ import annotations
 
-JUDGE_SYSTEM_PROMPT = r"""你是"记忆判断器"。分析本轮查询对话，判断是否有值得长期记住的信息。
+JUDGE_SYSTEM_PROMPT = r"""你是"记忆判断器"。分析本轮查询对话，判断是否有值得长期记住的**项目级**信息。
+写入的记忆会注入给该项目的所有用户，所以只记录对任何人都成立的知识。
 
 ## 值得记住的（should_save=true）
 
@@ -10,17 +11,14 @@ JUDGE_SYSTEM_PROMPT = r"""你是"记忆判断器"。分析本轮查询对话，�
    - 用户说"不是X，是Y"、"我要看的是Z"
    - 例子：系统默认选了 app_launch，用户纠正为 payment_submit
 
-2. **用户偏好**（category=preference）
-   - 用户表达了稳定偏好："我一般/总是/默认/习惯 看XX"
-   - 例子："我一般看近30天的"、"我习惯查UV"
-
-3. **约束发现**（category=constraint）
+2. **约束发现**（category=constraint）
    - 从对话中发现的项目特定规则
    - 例子："purchase 在这个项目里就是 payment_submit"
 
 ## 不值得记住的（should_save=false）
 
-- 普通查询（无纠正、无偏好表达、无新发现）
+- 普通查询（无纠正、无新发现）
+- 个人习惯/偏好（"我一般看近30天的"、"我习惯查UV"）：属于用户个人，不是项目规则
 - 已有记忆中已包含的信息
 - 一次性的、不确定的表述
 - 系统正常工作的高置信度匹配
@@ -28,7 +26,7 @@ JUDGE_SYSTEM_PROMPT = r"""你是"记忆判断器"。分析本轮查询对话，�
 ## 输出格式
 
 返回 JSON，不要输出其他内容：
-{"should_save": true/false, "category": "correction|preference|constraint", "content": "一句话描述，用中文"}
+{"should_save": true/false, "category": "correction|constraint", "content": "一句话描述，用中文"}
 """
 
 JUDGE_USER_TEMPLATE = r"""请分析以下查询是否值得写入长期记忆。
@@ -58,7 +56,7 @@ JUDGE_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "judge_memory",
-        "description": "判断是否需要将本轮对话信息写入长期记忆",
+        "description": "判断是否需要将本轮对话信息写入项目级长期记忆",
         "parameters": {
             "type": "object",
             "properties": {
@@ -68,7 +66,7 @@ JUDGE_TOOL_SCHEMA = {
                 },
                 "category": {
                     "type": "string",
-                    "enum": ["correction", "preference", "constraint"],
+                    "enum": ["correction", "constraint"],
                     "description": "记忆类别",
                 },
                 "content": {

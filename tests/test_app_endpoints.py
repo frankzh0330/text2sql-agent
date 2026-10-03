@@ -4,7 +4,7 @@ from unittest import mock
 import pytest
 from fastapi.testclient import TestClient
 
-from matcher.base import MatchResult
+from matcher.entity_matcher import MatchResult
 from matcher.matcher_service import MatcherService
 from service.llm_extractions import Extraction, SQLIntentJson
 from service.session_models import QueryState
@@ -14,10 +14,8 @@ from service.session_models import QueryState
 
 def _mr(matched, score, candidates=None):
     """构造 MatchResult，可选 top5 候选"""
-    explain = {}
-    if candidates:
-        explain["rerank_explain"] = {"top5": [{"name": v, "score": s} for v, s in candidates]}
-    return MatchResult(matched=matched, score=score, explain=explain)
+    cands = [{"name": v, "score": s} for v, s in (candidates or [])]
+    return MatchResult(matched=matched, score=score, candidates=cands)
 
 
 class FakeMatcher:
@@ -675,6 +673,33 @@ class TestCrossEncoderRerank:
         assert resp.json()["status"] == "needs_confirmation"
         rerank_mock.assert_not_called()  # 默认关闭，LLM 不被调用
 
+    def test_reranker_skipped_outside_confirmation_band(self, client, monkeypatch):
+        """已被确定性采纳的结果不再交给 LLM 终选（只在确认带触发）"""
+        monkeypatch.setenv("RERANKER_ENABLED", "true")
+
+        from service import reranker as reranker_module
+
+        intent = SQLIntentJson(
+            table_extractions=[Extraction(text="商品表")],
+            metric_extractions=[Extraction(text="销售额")],
+        )
+        svc = _make_service(
+            table_matcher=FakeMatcher({
+                "商品表": _mr("products", 95.0, candidates=[("products", 95.0), ("orders", 60.0)]),
+            }),
+            metric_matcher=FakeMatcher({"销售额": _mr("revenue", 100.0)}),
+            column_matcher=_fake_column_matcher(),
+        )
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                with mock.patch.object(reranker_module, "_rerank_via_llm") as rerank_mock:
+                    with _mock_generate_sql():
+                        resp = client.post("/nl2sql", json={"text": "商品表的销售额", "project_id": 55})
+
+        assert resp.json()["status"] == "success"
+        rerank_mock.assert_not_called()
+
 
 class TestWindowDemoteToOrder:
     """window 文本含方向词（最高/最低）→ 降级为全局 TopN"""
@@ -793,7 +818,7 @@ class TestColumnCollisionConfirmation:
 
     @staticmethod
     def _real_column_service():
-        """真实 ColumnMatcher（冲突逻辑在 base.py）+ fake 指标层"""
+        """真实列 EntityMatcher（冲突逻辑在 entity_matcher.py）+ fake 指标层"""
         return _make_service(metric_matcher=FakeMatcher({
             "revenue": _mr("revenue", 100.0),
             "order count": _mr("order_count", 100.0),

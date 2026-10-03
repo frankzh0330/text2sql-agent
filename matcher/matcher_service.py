@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from common.types import MatcherType
-from matcher.column_matcher import ColumnMatcher, build_column_matcher_from_schema
+from matcher import policy
+from matcher.entity_matcher import EntityMatcher
 from matcher.schema_loader import SQLSchema, load_sql_schema
-from matcher.sql_metric_matcher import SQLMetricMatcher, build_sql_metric_matcher_from_schema
-from matcher.table_matcher import TableMatcher, build_table_matcher_from_schema
 from matcher.time_matcher import TimeMatcher, resolve_last_n_days
 
 logger = logging.getLogger(__name__)
@@ -19,32 +18,19 @@ class ResolvedResult:
     """解析结果（含候选列表和置信度）"""
     value: str                      # 最终值（matched / inferred / default；列名为 "table.column"）
     score: float                    # 置信度 (0-100)
-    method: str                     # "exact" | "fuzzy" | "default" | "inferred_from_metric" ...
+    method: str                     # 见 resolve_with_candidates 的 method 取值
     candidates: List[Dict[str, Any]] = field(default_factory=list)
     needs_confirmation: bool = False  # 是否需要用户确认
 
 
-# 需要确认的置信度区间
-# 按实体类型校准的确认阈值：(auto_accept_high, confirm_low)
-# metric 错配代价最高（口径错则数字全错）→ auto-accept 收紧到 90；
-# table/column 的模糊命中大多是前缀/复数形态，80 即可
-_TYPE_CONFIRM_SCORES = {
-    MatcherType.TABLE: (80.0, 40.0),
-    MatcherType.METRIC: (90.0, 40.0),
-    MatcherType.COLUMN: (80.0, 40.0),
-}
-_DEFAULT_CONFIRM_SCORES = (80.0, 40.0)
-
-# top1 领先第二名不足该分值时，即使过 auto-accept 线也进确认流
-# （确定性并列歧义检测，如 orders/products 各 90 分的并列场景）
-_TIE_MARGIN = 10.0
+BiasFn = Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
 
 
 class MatcherService:
     """Matcher 服务：表 / 列 / 业务指标 / 时间 的确定性解析
 
-    匹配核心不变（倒排索引召回 + RapidFuzz 重排），目录从 event/metric/dimension
-    换成 schema YAML 中的表/列/业务指标。
+    三种实体共用 EntityMatcher（召回 + 别名打分），本类负责 accept / confirm 判定、
+    主表与 join 推断。
     """
 
     def __init__(self, catalog_path: str = "catalog"):
@@ -53,9 +39,9 @@ class MatcherService:
         self.schema: SQLSchema = load_sql_schema(catalog_path)
 
         logger.info("Building matcher indexes...")
-        self.table_matcher = build_table_matcher_from_schema(self.schema.tables)
-        self.column_matcher = build_column_matcher_from_schema(self.schema.columns)
-        self.metric_matcher = build_sql_metric_matcher_from_schema(self.schema.metrics)
+        self.table_matcher = EntityMatcher(self.schema.tables)
+        self.column_matcher = EntityMatcher(self.schema.columns)
+        self.metric_matcher = EntityMatcher(self.schema.metrics)
         self.time_matcher = TimeMatcher()
         logger.info("MatcherService initialized successfully!")
 
@@ -63,90 +49,61 @@ class MatcherService:
 
     def resolve_with_candidates(
         self, matcher_type: MatcherType, extractions: list, default: Optional[str] = None,
-        base_table: Optional[str] = None,
+        base_table: Optional[str] = None, bias: Optional[BiasFn] = None,
     ) -> ResolvedResult:
-        """从 LLM 提取结果中解析，返回完整候选和置信度
+        """从 LLM 提取结果中解析，返回完整候选和判定（阈值全部来自 matcher/policy.py）
 
-        exact 别名冲突（同名别名命中多实体）的消歧策略：
-        - 仅列冲突且恰为两路、且有基表上下文时：按 join 图距离唯一最近者确定性胜出
-          （revenue 语境下 "region" -> users.region，1 跳 vs sellers 2 跳）
-        - >=3 路（time/date/id 这类超泛化词）或无基表/距离并列 -> 确认流
+        固定顺序：
+        1. EntityMatcher 产出候选（exact / 召回 + 别名打分）
+        2. bias（可选，用户偏好弱加权）只重排候选分数，在判定之前生效；
+           阈值（采纳线 / CONFIRM_FLOOR）只看召回原始分 raw_score，偏好只能在都过线的候选间
+           打破并列，不能单凭加分把低置信候选推成静默采纳
+        3. exact 别名冲突：仅列冲突且恰为两路、有基表上下文时，按 join 图距离唯一最近者
+           确定性胜出（revenue 语境下 "region" -> users.region）；否则确认流
+        4. 分档：top1 >= 类型采纳线且不与第二名并列 → 采纳；>= CONFIRM_FLOOR 或并列 → 确认；
+           否则视为无匹配（返回 default，不确认）
 
-        判断规则（确定性代码，不依赖 LLM，阈值按实体类型校准）：
-        - score >= 类型 auto-accept 线 且领先第二名 >= 10 分 → 直接用
-        - 分数在确认带内（或与第二名并列）→ 需要用户确认
-        - score < 确认带下限 → 直接用 default，不确认（候选太模糊没价值）
+        method: exact | fuzzy | exact_collision_distance_resolved | exact_alias_collision |
+                fuzzy_tied | fuzzy_low_confidence | no_match | no_extractions
+                （偏好改变了 top1 时追加 "+user_bias"）
         """
         if not extractions:
-            return ResolvedResult(
-                value=default or "", score=0.0, method="no_extractions",
-                candidates=[], needs_confirmation=False,
-            )
+            return ResolvedResult(value=default or "", score=0.0, method="no_extractions")
 
         first = extractions[0]
         query_text = first.text if hasattr(first, "text") else first.get("text", "")
 
-        matcher = self._get_matcher(matcher_type)
-        result = matcher.match(query_text)
-        candidates = self._extract_candidates(result)
+        result = self._get_matcher(matcher_type).match(query_text)
+        candidates = [{"value": c["name"], "score": float(c["score"])} for c in result.candidates]
+        if not candidates and result.matched:
+            candidates = [{"value": result.matched, "score": float(result.score)}]
+        recall_top = candidates[0]["value"] if candidates else None
+        if bias and candidates:
+            candidates = bias(candidates)
+        suffix = "+user_bias" if candidates and candidates[0]["value"] != recall_top else ""
 
-        # exact 冲突：确定性消歧（两路 + 基表上下文 + 唯一最近），否则进确认流
         if result.explain.get("method") == "exact_alias_collision":
-            candidates = [
-                {"value": c["name"], "score": float(c["score"])}
-                for c in result.explain.get("collision_candidates", [])
-            ]
             resolved = self._resolve_exact_collision(matcher_type, base_table, candidates)
             if resolved is not None:
-                return ResolvedResult(
-                    value=resolved, score=100.0,
-                    method="exact_collision_distance_resolved",
-                    candidates=candidates, needs_confirmation=False,
-                )
-            return ResolvedResult(
-                value=default or "", score=100.0,
-                method="exact_alias_collision",
-                candidates=candidates, needs_confirmation=True,
-            )
+                return ResolvedResult(value=resolved, score=100.0,
+                                      method="exact_collision_distance_resolved", candidates=candidates)
+            return ResolvedResult(value=default or "", score=100.0, method="exact_alias_collision",
+                                  candidates=candidates, needs_confirmation=True)
 
-        high, low = _TYPE_CONFIRM_SCORES.get(matcher_type, _DEFAULT_CONFIRM_SCORES)
-        # 并列歧义：top1 与 top2 分差过小（exact 命中无候选列表，不受影响）
-        tied = (
-            len(candidates) >= 2
-            and float(candidates[1].get("score", 0.0)) >= result.score - _TIE_MARGIN
-        )
+        top_raw = float(candidates[0].get("raw_score", candidates[0]["score"])) if candidates else 0.0
+        if not candidates or top_raw < policy.CONFIRM_FLOOR:
+            return ResolvedResult(value=default or "", score=float(result.score),
+                                  method="no_match", candidates=candidates)
 
-        if result.matched:
-            if result.score >= high and not tied:
-                return ResolvedResult(
-                    value=result.matched, score=result.score,
-                    method="exact" if result.score == 100.0 else "fuzzy",
-                    candidates=candidates, needs_confirmation=False,
-                )
-            elif result.score >= low or tied:
-                return ResolvedResult(
-                    value=result.matched, score=result.score,
-                    method="fuzzy_tied" if tied and result.score >= high else "fuzzy_low_confidence",
-                    candidates=candidates, needs_confirmation=True,
-                )
-            else:
-                return ResolvedResult(
-                    value=default or result.matched, score=result.score,
-                    method="score_too_low",
-                    candidates=candidates, needs_confirmation=False,
-                )
-        else:
-            if candidates and result.score >= low:
-                return ResolvedResult(
-                    value=default or "", score=result.score,
-                    method="below_threshold",
-                    candidates=candidates, needs_confirmation=True,
-                )
-            return ResolvedResult(
-                value=default or "", score=result.score,
-                method="no_match",
-                candidates=candidates, needs_confirmation=False,
-            )
+        top = candidates[0]
+        tied = len(candidates) >= 2 and candidates[1]["score"] >= top["score"] - policy.TIE_MARGIN
+        if top_raw >= policy.ACCEPT_SCORE[matcher_type] and not tied:
+            return ResolvedResult(value=top["value"], score=top["score"],
+                                  method=("exact" if top["score"] >= 100.0 else "fuzzy") + suffix,
+                                  candidates=candidates)
+        method = "fuzzy_tied" if tied and top_raw >= policy.ACCEPT_SCORE[matcher_type] else "fuzzy_low_confidence"
+        return ResolvedResult(value=top["value"], score=top["score"], method=method + suffix,
+                              candidates=candidates, needs_confirmation=True)
 
     def resolve_time(self, extraction: Any) -> Tuple[int, Dict[str, Any]]:
         """解析时间范围 → (days, explain)；days 由 sql_generator 翻译为 CH 表达式"""
@@ -288,24 +245,3 @@ class MatcherService:
         elif matcher_type == MatcherType.METRIC:
             return self.metric_matcher
         raise ValueError(f"Unknown matcher_type: {matcher_type}")
-
-    @staticmethod
-    def _extract_candidates(result) -> List[Dict[str, Any]]:
-        """从 MatchResult.explain 中提取 top5 候选"""
-        rerank_explain = result.explain.get("rerank_explain", {})
-        top5 = rerank_explain.get("top5", [])
-        recall_explain = result.explain.get("recall_explain", {})
-        top_recall = recall_explain.get("top_candidates", [])
-
-        if top5:
-            return [
-                {"value": c["name"], "score": c["score"]}
-                for c in top5
-            ]
-        if top_recall:
-            # 优先用 IDF 加权分排序，兼容旧 explain 只有 hit_count 的场景
-            return [
-                {"value": c["name"], "score": float(c.get("score", c.get("hit_count", 0)))}
-                for c in top_recall[:5]
-            ]
-        return []

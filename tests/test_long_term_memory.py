@@ -126,3 +126,42 @@ class TestLongTermMemory:
         result = long_term_memory.load_memory_context(project_id=55, query_text="看激活数据")
         assert "activation_success" in result
         assert "payment_success" not in result
+
+    def test_selection_is_per_query_not_cached(self, long_term_memory, tmp_path):
+        """缓存只缓存磁盘内容；第二条 query 必须按自己的关键词重新选择"""
+        project_dir = tmp_path / "memory" / "project_55"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "activation.md").write_text("激活默认映射 activation_success", encoding="utf-8")
+        (project_dir / "payment.md").write_text("支付成功默认看 payment_success", encoding="utf-8")
+        (project_dir / "MEMORY.md").write_text(
+            "- [Activation](activation.md)\n- [Payment](payment.md)\n",
+            encoding="utf-8",
+        )
+
+        r1 = long_term_memory.load_memory_context(project_id=55, query_text="看激活数据")
+        r2 = long_term_memory.load_memory_context(project_id=55, query_text="看支付成功")
+        assert "activation_success" in r1 and "payment_success" not in r1
+        assert "payment_success" in r2 and "activation_success" not in r2
+
+    def test_list_file_selected_per_entry(self, long_term_memory, tmp_path):
+        """auto_learned.md 这类列表文件按条目选择，而不是整文件注入"""
+        project_dir = tmp_path / "memory" / "project_55"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "auto_learned.md").write_text(
+            "- [constraint] 交易表 对应 orders 表\n"
+            "- [correction] 退款率 指 refund_rate 而不是 cancel_rate\n",
+            encoding="utf-8",
+        )
+        (project_dir / "MEMORY.md").write_text("- [Auto Learned](auto_learned.md)\n", encoding="utf-8")
+
+        result = long_term_memory.load_memory_context(project_id=55, query_text="交易表的销售额")
+        assert "orders" in result
+        assert "refund_rate" not in result
+
+    def test_prose_file_kept_whole(self, long_term_memory, tmp_path):
+        global_dir = tmp_path / "memory" / "_global"
+        self._write_memory_index(global_dir, "rules.md", "# Rules\n- revenue 排除已取消订单\n- 时间默认近 7 天")
+
+        result = long_term_memory.load_memory_context(query_text="revenue")
+        assert "# Rules" in result
+        assert "时间默认近 7 天" in result

@@ -250,13 +250,13 @@ class QueryOrchestrator:
             pending_fields["tables"] = table_result.candidates
         if metric_result.needs_confirmation:
             pending_fields["metrics"] = metric_result.candidates
-        # 同名列 exact 冲突（>=3 路或无基表可消歧）→ 升级确认
-        group_collision = _first_collision(group_entries)
-        if group_collision:
-            pending_fields["group_by_column"] = group_collision
-        detail_collision = _first_collision(detail_entries)
-        if detail_collision:
-            pending_fields["detail_column"] = detail_collision
+        # 列需确认（同名冲突无法消歧 / 低置信 / 并列）→ 升级确认
+        group_pending = _first_pending_column(group_entries)
+        if group_pending:
+            pending_fields["group_by_column"] = group_pending
+        detail_pending = _first_pending_column(detail_entries)
+        if detail_pending:
+            pending_fields["detail_column"] = detail_pending
 
         if pending_fields:
             return await self._create_confirmation_task(
@@ -652,35 +652,31 @@ class QueryOrchestrator:
 
     async def _resolve_field(self, service, matcher_type, extractions, default, field_name,
                              project_id, user_id, query_text=None):
-        """统一 resolve + user preference bias +（可选）cross-encoder 终选"""
-        result = service.resolve_with_candidates(matcher_type, extractions, default=default)
-        bias = self._apply_bias(result, project_id=project_id, user_id=user_id, field_name=field_name)
-        if query_text:
-            await self._apply_cross_encoder(result, query_text, field_name, bias)
-        return result, bias
+        """统一 resolve：用户偏好在判定前弱加权候选；仍需确认时（可选）交给 LLM 受限终选"""
+        bias_explain: Dict[str, Any] = {}
+
+        def bias(candidates):
+            reranked, explain = self.preferences.rerank_candidates(
+                project_id, user_id, field_name, candidates)
+            bias_explain.update(explain)
+            return reranked
+
+        result = service.resolve_with_candidates(matcher_type, extractions, default=default, bias=bias)
+        if query_text and result.needs_confirmation:
+            await self._apply_cross_encoder(result, query_text, field_name, bias_explain)
+        return result, bias_explain
 
     async def _apply_cross_encoder(self, result, query_text, field_name, bias_explain):
-        """LLM cross-encoder 受限终选（RERANKER_ENABLED 开启时触发）
+        """LLM cross-encoder 受限终选（RERANKER_ENABLED 开启、且结果在确认带时触发）
 
-        触发条件（二选一）：
-        - 低置信确认带（needs_confirmation 或 score<80）
-        - 高分但 top1/top2 分差过小（并列歧义同样危险）
-
-        - relevance>=85 且 margin>=15 → 静默采纳（免一次确认打断）
+        - 相关性/分差过 policy.LLM_ACCEPT_* → 静默采纳（免一次确认打断）
         - 否则保持确认流，仅按相关性重排候选（最优排第一）
         - explain 记录在 bias_explain["cross_encoder_rerank"]
         """
         from service import reranker
 
-        if not reranker.is_reranker_enabled():
+        if not reranker.is_reranker_enabled() or len(result.candidates) < 2:
             return
-        if len(result.candidates) < 2:
-            return
-
-        if not result.needs_confirmation and result.score >= 80.0:
-            top2_score = float(result.candidates[1].get("score", 0.0))
-            if top2_score < float(result.score) - 5.0:
-                return  # 高置信且领先明显，无需终选
 
         reranked, rexplain = await reranker.rerank_candidates(query_text, field_name, result.candidates)
         bias_explain["cross_encoder_rerank"] = rexplain
@@ -695,23 +691,6 @@ class QueryOrchestrator:
             result.method = f"{result.method}+cross_encoder"
             result.needs_confirmation = False
 
-    def _apply_bias(self, result, *, project_id, user_id, field_name):
-        """应用用户偏好加权"""
-        reranked, bias_explain = self.preferences.rerank_candidates(
-            project_id, user_id, field_name, result.candidates,
-        )
-        if not bias_explain.get("applied"):
-            return bias_explain
-        top_candidate = reranked[0] if reranked else None
-        result.candidates = reranked
-        if top_candidate and top_candidate["value"] != result.value:
-            result.value = top_candidate["value"]
-            result.score = float(top_candidate["score"])
-            result.method = f"{result.method}+user_bias"
-        elif top_candidate:
-            result.score = max(float(result.score), float(top_candidate["score"]))
-        return bias_explain
-
     # ==================== 列 / 过滤解析 ====================
 
     def _resolve_texts_to_columns(
@@ -719,9 +698,10 @@ class QueryOrchestrator:
     ) -> tuple[list[str], list[dict]]:
         """自然语言片段 → 限定列名列表
 
-        - exact 冲突：两路 + 基表上下文时由 service 按 join 距离确定性消歧；
-          否则保留冲突候选（entry["collision_candidates"]），由调用方升级确认流
-        - 无匹配但有召回候选 → 取 top1（列歧义容忍，避免频繁打断用户）
+        - 只接受无需确认的结果（exact / fuzzy / 冲突按 join 距离消歧）
+        - 需要确认（exact 冲突无法消歧、低置信、并列）→ entry["confirm_candidates"]，
+          由调用方升级确认流；不再静默取召回 top1
+        - 低于确认下限 → 丢弃
         """
         resolved: list[str] = []
         entries: list[dict] = []
@@ -731,15 +711,11 @@ class QueryOrchestrator:
             r = service.resolve_with_candidates(
                 MatcherType.COLUMN, [Extraction(text=text)], base_table=base_table)
             entry = {"text": text, "method": r.method, "score": r.score}
-            if r.method == "exact_alias_collision":
-                entry["collision_candidates"] = r.candidates
+            if r.needs_confirmation:
+                entry["confirm_candidates"] = r.candidates
             elif r.value:
                 entry["column"] = r.value
                 resolved.append(r.value)
-            elif r.candidates:
-                top = r.candidates[0]["value"]
-                entry.update({"column": top, "note": "recall_top1"})
-                resolved.append(top)
             else:
                 entry["dropped"] = True
             entries.append(entry)
@@ -1078,11 +1054,11 @@ def _match_user_input_to_candidates(user_input: str, candidates: list[dict]) -> 
     return None
 
 
-def _first_collision(entries: list[dict]) -> Optional[list[dict]]:
-    """取第一个 exact 冲突的候选列表（用于升级确认流）"""
+def _first_pending_column(entries: list[dict]) -> Optional[list[dict]]:
+    """取第一个需确认列的候选列表（用于升级确认流）"""
     for e in entries:
-        if e.get("collision_candidates"):
-            return e["collision_candidates"]
+        if e.get("confirm_candidates"):
+            return e["confirm_candidates"]
     return None
 
 

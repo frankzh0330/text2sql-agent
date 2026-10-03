@@ -1,0 +1,93 @@
+# ============================================================
+# Physical catalog (mock of Unity Catalog)
+#
+# In production this file does not exist: tables / columns / types / comments /
+# owners / row counts are machine-maintained by the catalog (Unity Catalog,
+# DataHub, OpenMetadata, Hive Metastore or INFORMATION_SCHEMA) and pulled via its
+# API. The shape below mirrors the UC `GET /api/2.1/unity-catalog/tables` response,
+# trimmed to the fields this agent uses.
+#
+#   properties.num_rows        — table statistics (static cost estimate for the AST analyzer)
+#   columns[].type_text        — ClickHouse type
+#   columns[].distinct_values  — profiler output: periodic `SELECT DISTINCT` on
+#                                LowCardinality columns; filter values are normalized to these
+#
+# Synthetic e-commerce schema modelled after the public Olist dataset: a star
+# schema centred on `orders`; `sellers` is reachable only via products (2 hops).
+# Business names (aliases) live in aliases.yaml, metric definitions and joins in metrics.yaml.
+# ============================================================
+catalog_name: main
+schema_name: ecommerce
+
+tables:
+  - name: orders
+    comment: "Order fact table, one row per order"
+    owner: commerce-data
+    properties:
+      num_rows: 80000000
+    columns:
+      - {name: order_id, type_text: "UInt64", comment: "Order primary key"}
+      - {name: user_id, type_text: "UInt64", comment: "Buyer, FK to users.id"}
+      - {name: product_id, type_text: "UInt32", comment: "Ordered product, FK to products.id"}
+      - {name: amount, type_text: "Float64", comment: "Order amount in BRL"}
+      - {name: freight, type_text: "Float64", comment: "Shipping fee charged for the order"}
+      - {name: status, type_text: "LowCardinality(String)", comment: "Order lifecycle status",
+         distinct_values: [created, paid, shipped, delivered, canceled, refunded]}
+      - {name: channel, type_text: "LowCardinality(String)", comment: "Marketing acquisition channel of the order",
+         distinct_values: [organic, paid_search, social, email, referral]}
+      - {name: created_at, type_text: "DateTime", comment: "Order creation time"}
+  - name: users
+    comment: "User dimension table"
+    owner: growth-data
+    properties:
+      num_rows: 2000000
+    columns:
+      - {name: id, type_text: "UInt64", comment: "User primary key"}
+      - {name: region, type_text: "LowCardinality(String)", comment: "User region / country"}
+      - {name: city, type_text: "LowCardinality(String)", comment: "User city"}
+      - {name: vip_level, type_text: "LowCardinality(String)", comment: "Loyalty tier",
+         distinct_values: [bronze, silver, gold, platinum]}
+      - {name: registered_at, type_text: "DateTime", comment: "Registration time"}
+  - name: products
+    comment: "Product dimension table, one row per product"
+    owner: catalog-data
+    properties:
+      num_rows: 50000
+    columns:
+      - {name: id, type_text: "UInt32", comment: "Product primary key"}
+      - {name: category, type_text: "LowCardinality(String)", comment: "Product category"}
+      - {name: brand, type_text: "LowCardinality(String)", comment: "Product brand"}
+      - {name: price, type_text: "Float64", comment: "Current list price"}
+      - {name: seller_id, type_text: "UInt32", comment: "Seller, FK to sellers.id"}
+  - name: payments
+    comment: "Payment fact table, one row per payment of an order"
+    owner: finance-data
+    properties:
+      num_rows: 90000000
+    columns:
+      - {name: payment_id, type_text: "UInt64", comment: "Payment primary key"}
+      - {name: order_id, type_text: "UInt64", comment: "Paid order, FK to orders.order_id"}
+      - {name: payment_type, type_text: "LowCardinality(String)", comment: "Payment method",
+         distinct_values: [credit_card, debit_card, wallet, bank_transfer]}
+      - {name: amount, type_text: "Float64", comment: "Paid amount in BRL"}
+      - {name: installments, type_text: "UInt8", comment: "Number of installments"}
+      - {name: paid_at, type_text: "DateTime", comment: "Payment time"}
+  - name: reviews
+    comment: "Order review fact table, one row per review. rating is an integer 1-5"
+    owner: cx-data
+    properties:
+      num_rows: 30000000
+    columns:
+      - {name: review_id, type_text: "UInt64", comment: "Review primary key"}
+      - {name: order_id, type_text: "UInt64", comment: "Reviewed order, FK to orders.order_id"}
+      - {name: rating, type_text: "UInt8", comment: "Review score, integer 1-5"}
+      - {name: created_at, type_text: "DateTime", comment: "Review creation time"}
+  - name: sellers
+    comment: "Seller dimension table"
+    owner: catalog-data
+    properties:
+      num_rows: 20000
+    columns:
+      - {name: id, type_text: "UInt32", comment: "Seller primary key"}
+      - {name: region, type_text: "LowCardinality(String)", comment: "Seller region"}
+      - {name: joined_at, type_text: "DateTime", comment: "Seller onboarding time"}

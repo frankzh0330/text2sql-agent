@@ -175,7 +175,7 @@ class Extraction(BaseModel):
 class FilterExtraction(BaseModel):
     """过滤条件抽取：column/value 为自然语言片段，由 matcher 解析"""
     text: str
-    column: Optional[str] = None   # attribute phrase as the user said it, e.g. "membership level" (resolved by ColumnMatcher)
+    column: Optional[str] = None   # attribute phrase as the user said it, e.g. "membership level" (resolved by the column EntityMatcher)
     op: str = "="                  # = | != | > | < | >= | <= | in | like
     value: Optional[str] = None    # 如 "vip"（LLM 直接给出或从 text 截取）
 

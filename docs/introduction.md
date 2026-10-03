@@ -2,7 +2,7 @@
 title: "Introduction"
 ---
 
-`query-agent` is an **NL2SQL data agent for ClickHouse**. It turns natural-language questions into validated ClickHouse SQL — with deterministic entity resolution, multi-turn query state, a confirmation flow for ambiguous entities, and an AST-level analysis layer that catches drift before any SQL leaves the system.
+`text2sql-agent` is a **Text2SQL data agent for ClickHouse**. It turns natural-language questions into validated ClickHouse SQL — with deterministic entity resolution, multi-turn query state, a confirmation flow for ambiguous entities, and an AST-level analysis layer that catches drift before any SQL leaves the system.
 
 ## How it works
 
@@ -37,8 +37,8 @@ Q2 inherits metric / time / grouping from Q1 — only the deltas are extracted a
 
 ## Highlights
 
-- **Deterministic entity resolution** — IDF-weighted inverted-index recall with typo probing, RapidFuzz rerank over schema aliases, scored candidates, type-calibrated confirmation bands, and a deterministic tie guard
-- **Cross-encoder reranking** — constrained LLM final selection for ambiguous or tied matches (`RERANKER_ENABLED`)
+- **Deterministic entity resolution** — pluggable recall (IDF-weighted inverted index with typo probing by default) plus alias scoring weighted by alias-source confidence; one decision policy with type-calibrated confirmation bands and a deterministic tie guard
+- **Cross-encoder reranking** — constrained LLM final selection, only inside the confirmation band (`RERANKER_ENABLED`)
 - **Grounded SQL generation** — the generation prompt pins resolved table/column names, metric expressions, join conditions, and time predicates; the LLM assembles structure only
 - **AST post-analysis** — column existence, entity-fidelity assertions, join-key consistency, and static cost estimates, wired into a bounded repair loop
 - **Multi-turn as a state machine** — field-level patch merge with explicit/inherited provenance, persisted and restart-recoverable
@@ -46,7 +46,7 @@ Q2 inherits metric / time / grouping from Q1 — only the deltas are extracted a
 
 ## Where to go next
 
-- [Quickstart & API](/README) — run the service, call `POST /nl2sql`, environment variables
+- [Quickstart & API](https://github.com/frankzh0330/text2sql-agent#quick-start) — run the service, call `POST /nl2sql`, environment variables
 - [Telegram testing](/TELEGRAM_TEST) — end-to-end verification steps over Telegram
 - [Architecture](/ARCHITECTURE) — layer responsibilities, dependency direction, scenarios
 - [Evaluation](/EVALUATION) — golden-case harness, live eval, known-gap xfail map

@@ -1,10 +1,10 @@
-# Query Agent
+# Text2SQL Agent
 
-[English](README.md) | [Chinese](docs/README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 Formatted documentation: [query-agent.mintlify.app](https://query-agent.mintlify.app/)
 
-`query-agent` is a **NL2SQL Data Agent for ClickHouse**. It accepts natural language questions, extracts query intent fragments (`table / metric / column / filter / time / group_by / order / window`), resolves them to canonical schema entities with deterministic matchers, and generates validated ClickHouse SQL — with multi-turn sessions, confirmation flows for ambiguous entities, project memory, and user-preference reranking.
+`text2sql-agent` is a **Text2SQL Data Agent for ClickHouse**. It accepts natural language questions, extracts query intent fragments (`table / metric / column / filter / time / group_by / order / window`), resolves them to canonical schema entities with deterministic matchers, and generates validated ClickHouse SQL — with multi-turn sessions, confirmation flows for ambiguous entities, project memory, and user-preference signals.
 
 The project is not a plain text2sql demo. It is a controlled data agent with:
 
@@ -24,7 +24,7 @@ Natural Language
   -> Deterministic Entity Resolution (Layer 2: table / column / metric / time)
   -> QueryState / Turn Logic
   -> LLM SQL Generation grounded on resolved entities (Layer 3)
-  -> sqlglot Validation (read-only, table whitelist, auto LIMIT)
+  -> sqlglot Validation + AST Analysis (repair loop on failure)
   -> ClickHouse SQL
 ```
 
@@ -35,21 +35,22 @@ Gateway
   -> Ingress
   -> Message Bus
   -> Agent Worker
-  -> NL2SQL Pipeline
+  -> Text2SQL Pipeline
   -> Dispatcher
 ```
 
 ## Highlights
 
-- **Deterministic entity resolution**: table/column/metric names are resolved by IDF-weighted inverted-index recall (discriminative tokens dominate generic ones) with edit-distance typo probing, then RapidFuzz rerank against the schema catalog (scored, with candidates) — the LLM never invents entity names
-- **Confirmation flow as guardrail**: low-confidence entities trigger explicit user confirmation instead of silent guessing — thresholds are calibrated per entity type (metrics are stricter: auto-accept at 90, since a wrong metric means wrong numbers), and a deterministic tie guard sends top candidates that are within 10 points of each other to confirmation even above the acceptance line; missing join paths escalate too
-- **Schema-configured joins**: join relationships come from metadata, not LLM invention
-- **Turn-based Q&A**: `last_query_state` + follow-up detection + field-level patch merge (a state machine, not chat replay)
-- **Grounded SQL generation**: the generation prompt pins resolved table/column/metric names, join conditions, and time predicates; the LLM assembles query structure only
-- **sqlglot validation**: single read-only statement, table whitelist, default LIMIT injection, and a repair loop with error feedback (max 2 rounds)
+- **Deterministic entity resolution**: tables, columns and metrics are matched against the metadata by code, with a confidence score per match — the LLM never invents entity names
+- **Ask, don't guess**: uncertain or ambiguous matches go to the user as a short choice; metrics need a higher score than tables or columns, because a wrong metric means wrong numbers; missing join paths are escalated too
+- **Metadata split like an enterprise**: a mock physical catalog (Unity Catalog), a mock semantic layer (LookML: metric definitions and joins) and an alias table where each alias carries its source and confidence
+- **Grounded SQL generation**: the LLM writes SQL only from resolved names, join conditions and time filters; it assembles the structure
+- **Validation and repair**: read-only single statement, table whitelist, default LIMIT, column/join checks, and a check that the agreed metric definitions actually appear in the SQL; failures go back to the LLM (max 2 repair rounds)
+- **Optional LLM reranker** (`RERANKER_ENABLED=true`): for ambiguous matches only, it can pick a clear winner from the existing candidates and never invent new ones
+- **Turn-based Q&A**: follow-ups patch the previous query state field by field (a state machine, not chat replay)
 - Session persistence (JSONL append-only, restart recovery) and pending-task persistence (idempotent confirmation)
-- Async memory learning: successful queries can write back correction/preference/constraint memory
-- End-to-end eval suite for new queries, follow-ups, confirmations, memory injection, and restart recovery
+- Async memory learning: an LLM judge can write project-level correction/constraint memory back from successful queries (personal preferences stay out of project memory)
+- End-to-end evaluation: 45 golden cases (mocked pytest suite + real-LLM live eval)
 
 ## Example Session
 
@@ -74,12 +75,14 @@ Q2 inherits metric / time / grouping from Q1 — only the deltas are extracted a
 
 ### 1. Layered Generation
 
-- **Layer 1 (LLM extraction)** only splits the question into intent fragments — it never names tables or columns.
-- **Layer 2 (matchers)** resolves fragments to canonical `table` / `table.column` / `metric_id` names with scores: auto-accept thresholds are calibrated per type (metric 90, table/column 80), scores in the confirmation band (40 up to the threshold) require user confirmation, and a top-1/top-2 margin under 10 points forces confirmation even above the threshold; < 40 drops or falls back. Recall is IDF-weighted (BM25-lite) with edit-distance-1 typo probing for zero-hit tokens. Same-alias collisions across entities (e.g. `amount` on two tables) are never silently first-wins: they resolve by join distance when a base table is known, or surface as confirmation. The main table is inferred when the user does not name one (from the metric's declared table or column ownership votes).
-- **Layer 3 (SQL generation)** is an LLM call *grounded* on resolved entities. The prompt pins table names, column names, metric expressions, join conditions, and the time predicate; the LLM assembles structure (GROUP BY / JOIN / window ranking via `LIMIT n BY`).
-- **Validation** (sqlglot, `dialect="clickhouse"`) enforces read-only single statements, a table whitelist, and default LIMIT; failed generations are repaired with error feedback.
-- **AST post-analysis** (`service/sql_ast_analyzer.py`) then runs on the validated SQL: column-existence checks (with alias resolution via sqlglot qualify), entity-fidelity assertions (resolved tables / metric expressions / filter predicates must survive into the SQL — catching semantic drift), join-edge and join-key consistency against the declared `joins:` config, and static cost analysis (scan estimates from `est_rows`, full-scan-on-fact-table detection, join-chain depth). Analysis errors feed the same repair loop; warnings and cost metrics are reported in `explain.resolver_explain.sql_generation.ast_analysis`.
-- **Cross-encoder reranking** (`service/reranker.py`, `RERANKER_ENABLED=true`) is a constrained LLM final selection step for ambiguous matches: when the matcher lands in the confirmation band — or top candidates are tied — the LLM rescores the existing candidates (it can only pick from them, never invent values). A clear winner (relevance ≥ 85 with margin ≥ 15) is silently accepted, turning a would-be confirmation interrupt into a direct answer; otherwise the confirmation flow proceeds with better-ordered candidates. Production can swap in a local cross-encoder model (e.g. bge-reranker-v2-m3) behind the same interface.
+Each question goes through four steps. The LLM is used in only two of them, and it is never the one that picks names:
+
+1. **Understand** — the LLM pulls out the phrases that matter (what to measure, how to group, which time range, which filters). It does not name any table or column.
+2. **Resolve** — deterministic code maps those phrases to real tables, columns and metrics, and gives each match a confidence score. Clear matches go through. Uncertain or ambiguous ones are put to the user as a short choice instead of being guessed.
+3. **Write SQL** — the LLM writes the ClickHouse query, but only from the names resolved in step 2. It decides the structure; it cannot introduce new names.
+4. **Check** — deterministic code checks the SQL: read-only, only known tables and columns, joins that match the metadata, and the agreed metric definitions actually used. If a check fails, the error goes back to the LLM for a limited number of repair attempts.
+
+How matching, thresholds and validation work in detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ### 2. Turn-Based Querying
 
@@ -98,7 +101,7 @@ Turn detection is rule-based (`followup_resolver`), state merging is field-level
 
 - `Session Memory` — `last_query_state / pending_task / recent turns`, JSONL persisted and restart-recoverable
 - `Project Memory` — project-scoped corrections/constraints (`project_{id}/MEMORY.md`), keyword-selected and injected into the extraction prompt
-- `User Preference Signal` — per `project_id + user_id` usage counts of tables/metrics/columns, applied only as a weak post-recall rerank bias
+- `User Preference Signal` — per `project_id + user_id` usage counts of tables/metrics/columns, used only as a weak, bounded bias on candidates before the accept/confirm decision
 
 ## Quick Start
 
@@ -115,9 +118,7 @@ pip install -r requirements.txt
 
 ### Configure
 
-```bash
-cp .env.example .env
-```
+Create a `.env` file in the repository root (it is git-ignored) and set at least the LLM key, e.g. `ZHIPU_API_KEY=...`.
 
 Common environment variables:
 
@@ -125,8 +126,9 @@ Common environment variables:
 |---|---|---|---|
 | `PORT` | No | `8000` | HTTP port |
 | `HOST` | No | `0.0.0.0` | Bind address |
-| `LOG_LEVEL` | No | `DEBUG` | Logging level |
+| `LOG_LEVEL` | No | `INFO` | Logging level |
 | `LLM_BACKEND` | No | `zhipu` | `zhipu` or `ollama` |
+| `ZHIPU_API_KEY` | Yes (zhipu) | - | Zhipu API key |
 | `ZHIPU_MODEL` | No | `glm-4` | Extraction + SQL generation model |
 | `TOOL_CALLING_ENABLED` | No | `true` | `false` forces prompt-based JSON output |
 | `RERANKER_ENABLED` | No | `false` | `true` enables LLM cross-encoder reranking for ambiguous matches |
@@ -195,9 +197,10 @@ flowchart TD
     Turn -->|Needs Confirmation| Task["Task Manager"]
     Task --> Confirm["User Reply"]
     Confirm --> State
-    State --> Join["Join Inference<br/>(schema config)"]
+    State --> Join["Join Inference<br/>(semantic layer)"]
     Join --> Gen["LLM SQL Generation<br/>(ClickHouse, grounded)"]
-    Gen --> Validate["sqlglot Validators"]
+    Gen --> Validate["sqlglot Validation<br/>+ AST Analysis"]
+    Validate -->|fail: feed error back| Gen
     Validate --> Response["ClickHouse SQL"]
     Validate --> Memory["Async Memory Learning"]
 ```
@@ -207,7 +210,7 @@ For a deeper module breakdown, see [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Project Layout
 
 ```text
-query-agent/
+text2sql-agent/
 ├── app.py                     # FastAPI route (POST /nl2sql) + global wiring
 ├── server.py                  # lifecycle bootstrap + gateway/bus wiring
 ├── gateway/                   # Telegram gateway
@@ -219,6 +222,8 @@ query-agent/
 │   ├── llm_extractions.py     # Layer 1: intent extraction (SQLIntentJson)
 │   ├── sql_generator.py       # Layer 3: grounded SQL generation + repair loop + time exprs
 │   ├── sql_validator.py       # sqlglot guardrails
+│   ├── sql_ast_analyzer.py    # AST checks: columns, joins, metric fidelity, scan cost
+│   ├── reranker.py            # optional constrained LLM reranker
 │   ├── query_orchestrator.py  # three turn paths (new / followup / confirmation)
 │   ├── session_manager.py     # session memory (JSONL persisted)
 │   ├── session_models.py      # QueryState / TaskContext / SessionContext
@@ -226,29 +231,36 @@ query-agent/
 │   ├── followup_resolver.py   # rule-based turn detection
 │   └── query_state_merger.py  # field-level patch merge
 ├── matcher/
-│   ├── base.py                # IDF-weighted inverted index + typo probing + RapidFuzz (core)
-│   ├── schema_loader.py       # sql_schema.yaml -> SQLSchema
-│   ├── table_matcher.py       # table name resolution
-│   ├── column_matcher.py      # column resolution (doc = "table.column")
-│   ├── sql_metric_matcher.py  # business metric resolution
+│   ├── schema_loader.py       # source adapters (catalog / semantic layer / alias table) -> SQLSchema
+│   ├── entity_matcher.py      # EntityMatcher + Retriever interface + LexicalRetriever
+│   ├── policy.py              # all accept / confirm / tie / LLM-accept thresholds
 │   ├── time_matcher.py        # time range parsing
-│   └── matcher_service.py     # unified resolution + table/join inference
+│   └── matcher_service.py     # decision (resolve_with_candidates) + table/join inference
 ├── memory/                    # project memory / memory writer / user preferences
-├── catalog/sql_schema.yaml    # demo schema metadata (see Production Notes)
+├── catalog/                   # demo metadata: tables.yaml / metrics.yaml / aliases.yaml (see below)
 ├── data/                      # session / task / memory / preference runtime data
 └── tests/                     # unit + integration + data-driven e2e evals
 ```
 
 ## Schema Metadata & Production Notes
 
-Table/column/metric metadata lives in [catalog/sql_schema.yaml](catalog/sql_schema.yaml) — a local demo sample (a six-table e-commerce schema — `orders / users / products / payments / reviews / sellers` — with declarative joins and metric expressions such as `revenue = sum(orders.amount)`). Aliases are English only, so ask demo queries in English.
+Metadata is split the way it is in an enterprise — each file mocks one independently maintained system and is read by its own source adapter in `matcher/schema_loader.py`, then merged into one in-memory `SQLSchema` (the matcher and AST analyzer never see files):
+
+| File | Mocks | Contents |
+|------|-------|----------|
+| [catalog/tables.yaml](catalog/tables.yaml) | Physical catalog (Unity Catalog / DataHub / `INFORMATION_SCHEMA`) — machine-maintained | tables, columns, types, comments, owner, row counts, profiled distinct values of low-cardinality columns |
+| [catalog/metrics.yaml](catalog/metrics.yaml) | Semantic layer (LookML) | governed metric definitions (`revenue = sum(orders.amount)`), the join graph, each view's default time dimension |
+| [catalog/aliases.yaml](catalog/aliases.yaml) | Alias table | one row per `(entity_id, alias, source, confidence, status, updated_by)`; the source sets a default confidence (curated 1.0, glossary 0.9, comment 0.7, query_log / feedback 0.6, llm 0.5); `pending` rows are not indexed |
+
+The sample is a six-table e-commerce schema (`orders / users / products / payments / reviews / sellers`). References across files are validated at load time (fail fast). Aliases are English only, so ask demo queries in English.
 
 This demo deliberately stops at **NL → validated ClickHouse SQL**. The following production extensions are documented as the intended direction and are not implemented here:
 
-1. **Metadata sourcing** — `sql_schema.yaml` is the development/demo input. In production, table/column/metric metadata should be synced from the company metadata service (or `INFORMATION_SCHEMA`) on a schedule, then fed into `load_sql_schema()` to hot-rebuild matcher indexes. In this demo the YAML is loaded exactly once at server startup (`server.py` lifespan → `MatcherService.__init__`) and no sync scheduler exists; the planned scheduler is periodic pull → `load_sql_schema()` → rebuild `MatcherService` → `set_matcher_service()` hot swap (the swap seam is already in place).
-2. **Query execution** — running the SQL against a real ClickHouse (read-only account, statement timeout, row/cost caps, result caching) is a downstream step; the current API returns SQL only.
-3. **Result rendering** — chart/table rendering of query results belongs to the presentation layer.
-4. **Governance hardening** — row-level security via user-scoped predicates, per-user rate limits, PII masking, and full audit logging are natural next steps on top of the existing validator.
+1. **Metadata sourcing** — the three YAML files are the development/demo input. In production each source adapter is swapped for the real API client (Unity Catalog REST for tables, the LookML / dbt semantic-layer API for metrics and joins, the alias DB table fed by glossary sync, comment extraction, query-log mining, offline LLM generation with review, and confirmation feedback), synced on a schedule, then fed into `load_sql_schema()` to hot-rebuild matcher indexes. In this demo the YAML is loaded exactly once at server startup (`server.py` lifespan → `MatcherService.__init__`) and no sync scheduler exists; the planned scheduler is periodic pull → `load_sql_schema()` → rebuild `MatcherService` → `set_matcher_service()` hot swap (the swap seam is already in place).
+2. **Semantic recall** — `EntityMatcher` accepts a list of `Retriever`s (`retrieve(query, k) -> (names, explain)`) and unions their candidates; scoring and the decision policy stay unchanged. The demo ships only `LexicalRetriever`. To add embedding recall in production, embed each entity's aliases + comment/description offline into a vector index, implement a `Retriever` that embeds the query and returns the top-k entity names, and pass `retrievers=[LexicalRetriever(entities), EmbeddingRetriever(...)]`. Low-confidence results still go through the confirmation flow / LLM reranker.
+3. **Query execution** — running the SQL against a real ClickHouse (read-only account, statement timeout, row/cost caps, result caching) is a downstream step; the current API returns SQL only.
+4. **Result rendering** — chart/table rendering of query results belongs to the presentation layer.
+5. **Governance hardening** — row-level security via user-scoped predicates, per-user rate limits, PII masking, and full audit logging are natural next steps on top of the existing validator.
 
 ## Evaluation
 
@@ -257,47 +269,36 @@ The project uses two kinds of tests:
 - unit / integration tests
 - data-driven end-to-end eval cases: [tests/evals/nl2sql_cases.yaml](tests/evals/nl2sql_cases.yaml) + [tests/test_end_to_end_evals.py](tests/test_end_to_end_evals.py)
 
-Current coverage includes:
-
-- basic new query (explicit table, and table inferred from a metric)
-- follow-up patches (time / metric / window rank)
-- follow-up + confirmation
-- project memory injection
-- confirmation after restart
+Coverage: 45 golden cases in 9 groups (single table, joins, multi-hop joins, time, filters, ambiguity, window/TopN, follow-ups, negative cases); known gaps are marked as strict xfail. See [EVALUATION.md](docs/EVALUATION.md).
 
 The eval harness mocks LLM extraction and SQL generation but runs the real matcher service, threshold logic, state merging, confirmation flow, and persistence — golden cases pin down the deterministic core of the pipeline.
 
-Run:
-
 ```bash
-./.venv311/bin/pytest -q
+pytest -q
 ```
+
+[scripts/live_eval.py](scripts/live_eval.py) replays the same cases against the real LLM to measure extraction and SQL quality, which the mocked suite cannot.
 
 ## Docs Map
 
 - [Formatted Docs](https://query-agent.mintlify.app/): hosted Mintlify documentation
-- [docs/README.md](docs/README.md): documentation index
-- [README.zh-CN.md](docs/README.zh-CN.md): Chinese readme
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md): current architecture, module ownership, and dependency direction
-- [ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md): Chinese architecture document
-- [EVALUATION.md](docs/EVALUATION.md): eval harness, golden cases, and regression strategy
-- [MEMORY.md](docs/MEMORY.md): session/project/user memory design
-- [MEMORY.zh-CN.md](docs/MEMORY.zh-CN.md): Chinese memory design document
-- [docs/diagrams/architecture.md](docs/diagrams/architecture.md): Mermaid architecture diagrams
-- [docs/diagrams/sequence.md](docs/diagrams/sequence.md): sequence diagrams
-- [docs/diagrams/flowchart.md](docs/diagrams/flowchart.md): high-level flowcharts
-- [TELEGRAM_TEST.md](docs/TELEGRAM_TEST.md): Telegram testing notes
+- [README.zh-CN.md](README.zh-CN.md): Chinese readme
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) / [ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md): architecture, module ownership, matching and validation details
+- [EVALUATION.md](docs/EVALUATION.md) / [EVALUATION.zh-CN.md](docs/EVALUATION.zh-CN.md): eval harness, golden cases, and regression strategy
+- [MEMORY.md](docs/MEMORY.md) / [MEMORY.zh-CN.md](docs/MEMORY.zh-CN.md): session/project/user memory design
+- [TELEGRAM_TEST.md](docs/TELEGRAM_TEST.md) / [TELEGRAM_TEST.zh-CN.md](docs/TELEGRAM_TEST.zh-CN.md): Telegram testing notes
+- [docs/diagrams/](docs/diagrams/): Mermaid architecture, sequence, flowchart and matcher-sequence diagrams
 
 ## Current Status
 
 The main capabilities currently in place are:
 
-- `NL -> validated ClickHouse SQL` pipeline (single table, joins from schema config, grouped ranking via `LIMIT n BY`)
+- `NL -> validated ClickHouse SQL` pipeline (single table, joins declared in the semantic layer, grouped ranking via `LIMIT n BY`)
 - turn-based query handling with structured state merging
 - confirmation flow with persisted, idempotent tasks
 - session/task persistence and restart recovery
 - project memory injection
-- user preference rerank signal
+- user preference signal (weak bias before the accept/confirm decision)
 - async memory learning
 - end-to-end eval harness
 

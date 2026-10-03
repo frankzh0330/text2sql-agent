@@ -2,7 +2,7 @@
 title: "Telegram Testing Guide"
 ---
 
-[Chinese version](https://github.com/frankzh0330/query-agent/blob/master/docs/TELEGRAM_TEST.zh-CN.md)
+[Chinese version](https://github.com/frankzh0330/text2sql-agent/blob/master/docs/TELEGRAM_TEST.zh-CN.md)
 
 ## Start The Service
 
@@ -15,7 +15,7 @@ export TELEGRAM_BOT_TOKEN="your_bot_token_here"
 # LLM configuration
 export LLM_BACKEND="zhipu"  # or "ollama"
 export ZHIPU_API_KEY="your_zhipu_key"  # when using zhipu
-export OLLAMA_BASE_URL="http://localhost:11434"  # when using ollama
+export OLLAMA_BASE_URL="http://localhost:11434/v1"  # when using ollama
 ```
 
 ### 2. Run
@@ -78,7 +78,7 @@ http://localhost:8000/docs
 curl http://localhost:8000/sessions
 ```
 
-### Test The NL2SQL API Directly
+### Test The Text2SQL API Directly
 
 ```bash
 curl -X POST http://localhost:8000/nl2sql \
