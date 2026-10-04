@@ -7,7 +7,7 @@
   catalog/metrics.yaml  ← 语义层（模拟 LookML）：指标定义、join 图、默认时间维度
   catalog/aliases.yaml  ← alias 表：(entity_id, alias, source, confidence, status)
 
-生产方向：把 adapter 换成对应系统的 API 客户端，定时同步后重建索引（见 README Production Notes）。
+生产方向：把 adapter 换成对应系统的 API 客户端，定时同步后重建索引（见 README「Real Production Environment」）。
 
 产出结构：
   tables:   {table: {aliases, alias_weights, description, owner, time_column, est_rows,

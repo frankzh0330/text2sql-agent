@@ -10,7 +10,7 @@
    - 意图中的表必须出现在 SQL 中
    - 指标聚合表达式（如 sum(orders.amount)）必须存在
    - 过滤谓词（列 op 值）必须存在
-3. 静态成本（无数据库近似，真值靠 ClickHouse EXPLAIN，见 README Production Notes）
+3. 静态成本（无数据库近似，真值靠 ClickHouse EXPLAIN，见 README「Real Production Environment」）
    - 扫描量估算（schema est_rows）、大扫描警告
    - 事实表有时间列却未被任何条件引用 → full_scan 警告
    - join 链长度、子查询嵌套深度
@@ -171,6 +171,37 @@ def _collect_predicates(ast: exp.Expression, alias_map: Dict[str, str]) -> Set[s
     return keys
 
 
+def _check_window_limit(ast: exp.Expression, alias_map: Dict[str, str], window: Dict[str, Any]) -> Optional[str]:
+    """window 意图 {group_by, limit} → SQL 中必须有 LIMIT <limit> BY <group_by>；不满足返回错误文本
+
+    BY 项可以写限定列（users.region）、裸列名（region），或 SELECT 中该列的别名。
+    """
+    group, limit = window.get("group_by"), window.get("limit")
+    if not group or not limit:
+        return None
+    expected = f"LIMIT {limit} BY {group}"
+
+    col_name = group.split(".")[-1].lower()
+    accepted = {_norm(group), col_name}
+    for sel in ast.find_all(exp.Select):
+        for e in sel.expressions:
+            if isinstance(e, exp.Alias) and _norm(_apply_alias_map(e.this.sql(dialect=DIALECT), alias_map)) == _norm(group):
+                accepted.add(e.alias.lower())
+
+    limit_nodes = list(ast.find_all(exp.Limit))
+    by_nodes = [l for l in limit_nodes if l.expressions]
+    if not by_nodes:
+        found = f"`{limit_nodes[0].sql(dialect=DIALECT)}` (a global top-N)" if limit_nodes else "no LIMIT"
+        return f"missing_limit_by: the intent is top {limit} per {group}, which requires `{expected}`; the SQL has {found}"
+    for l in by_nodes:
+        by = {_norm(_apply_alias_map(c.sql(dialect=DIALECT), alias_map)) for c in l.expressions}
+        n = l.expression.sql(dialect=DIALECT) if l.expression is not None else ""
+        if by & accepted and n == str(limit):
+            return None
+    found = by_nodes[0].sql(dialect=DIALECT)
+    return f"window_limit_mismatch: the intent requires `{expected}`, the SQL has `{found}`"
+
+
 def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> AnalysisResult:
     """主入口：结构校验 + 实体保真 + 静态成本"""
     result = AnalysisResult()
@@ -268,6 +299,12 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
             result.errors.append(
                 f"missing_filter: filter {f.get('column')} {f.get('op')} {f.get('value')} does not appear in the SQL"
             )
+
+    # 分组内 top-N（window 意图）：必须是 ClickHouse 的 LIMIT n BY <分组列>。
+    # 只写 LIMIT n 会变成全局 top-N，语义不同但语法合法，LLM 偶尔会这样写
+    window_error = _check_window_limit(qualified, alias_map, intent.get("window") or {})
+    if window_error:
+        result.errors.append(window_error)
 
     # ==================== 时间过滤（成本相关警告）====================
     base = intent.get("base_table")

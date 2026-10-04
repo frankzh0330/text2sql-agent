@@ -25,6 +25,7 @@ from memory.user_preference_store import UserPreferenceStore
 from service.followup_resolver import FollowupDecision, detect_followup
 from service.llm_extractions import Extraction, extract_llm_async
 from service.query_state_merger import merge_query_state
+from service.resolution_trace import build_trace
 from service.session_manager import SessionManager
 from service.session_models import QueryState
 from service.sql_ast_analyzer import build_analysis_context
@@ -71,7 +72,22 @@ class QueryOrchestrator:
     # ==================== 主入口 ====================
 
     async def process(self, req, service, catalog=None, notify_fn=None) -> dict:
-        """主入口：路由到三条处理路径
+        """主入口：路由处理后附加 resolution trace（INFO 日志 + explain["trace"]）"""
+        result = await self._route(req, service, notify_fn=notify_fn)
+        try:
+            trace = build_trace(result)
+        except Exception as e:  # trace 只用于排查，绝不影响主流程
+            logger.warning("build_trace failed: %s", e)
+            return result
+        sid = result.get("session_id") or req.session_id or "-"
+        logger.info("[trace %s] input %r", sid, req.text)
+        for line in trace:
+            logger.info("[trace %s] %s", sid, line)
+        result.setdefault("explain", {})["trace"] = trace
+        return result
+
+    async def _route(self, req, service, notify_fn=None) -> dict:
+        """路由到三条处理路径
 
         Args:
             req: NL2SQLRequest
@@ -133,6 +149,7 @@ class QueryOrchestrator:
                 extraction_json=extraction_json.model_dump(), status="early_exit",
                 session_id=ctx.session_id,
                 message="You have not entered any table, metric or query condition, so no SQL can be generated.",
+                explain={"turn_decision": _serialize_followup_decision(followup_decision)},
             )
 
         # 5. Follow-up 路径
@@ -183,11 +200,11 @@ class QueryOrchestrator:
         column_explain: Dict[str, Any] = {}
         group_by_cols, group_entries = self._resolve_texts_to_columns(
             service, [e.text for e in extraction_json.group_by_extractions], column_explain,
-            base_table=base_hint,
+            base_table=base_hint, role="group_by",
         )
         detail_cols, detail_entries = self._resolve_texts_to_columns(
             service, [e.text for e in extraction_json.column_extractions], column_explain,
-            base_table=base_hint,
+            base_table=base_hint, role="detail",
         )
         filters = self._resolve_filters(
             service, extraction_json.filter_extractions, column_explain, base_table=base_hint)
@@ -210,7 +227,7 @@ class QueryOrchestrator:
                     column_explain["window"] = {"recovered_from_full_text": True, "fragment": w_text}
             if w:
                 w_cols, _ = self._resolve_texts_to_columns(
-                    service, [w["group_text"]], column_explain, base_table=base_hint)
+                    service, [w["group_text"]], column_explain, base_table=base_hint, role="window")
                 if w_cols:
                     window = {"group_by": w_cols[0], "limit": w["limit"]}
                 else:
@@ -278,6 +295,7 @@ class QueryOrchestrator:
         base_table, table_infer_explain = service.infer_main_table(
             tables, metric_ids, group_by_cols + detail_cols + [f["column"] for f in filters],
         )
+        table_infer_explain = {**table_infer_explain, "table": base_table}
         if not base_table:
             return self._make_response(
                 extraction_json=extraction_json.model_dump(), status="early_exit",
@@ -294,6 +312,7 @@ class QueryOrchestrator:
         )
         if join_error:
             # join 缺失 → 确认流（候选 = 主表邻接表）
+            resolver_explain["sql_generation"] = gen_explain
             return await self._create_join_confirmation(
                 req, ctx, extraction_json, followup_decision, prev_qs,
                 query_state, service, join_error, resolver_explain,
@@ -363,6 +382,7 @@ class QueryOrchestrator:
         merged_state = merge_query_state(prev_qs, patch_result.patch, req.project_id)
         sql, gen_explain, join_error = await self._generate_sql_from_state(req.text, merged_state, service)
         if join_error:
+            patch_result.resolver_explain["sql_generation"] = gen_explain
             return await self._create_join_confirmation(
                 req, ctx, extraction_json, decision, prev_qs,
                 merged_state, service, join_error, patch_result.resolver_explain,
@@ -695,6 +715,7 @@ class QueryOrchestrator:
 
     def _resolve_texts_to_columns(
         self, service, texts: list[str], explain_sink: dict, base_table: Optional[str] = None,
+        role: str = "column",
     ) -> tuple[list[str], list[dict]]:
         """自然语言片段 → 限定列名列表
 
@@ -710,7 +731,9 @@ class QueryOrchestrator:
                 continue
             r = service.resolve_with_candidates(
                 MatcherType.COLUMN, [Extraction(text=text)], base_table=base_table)
-            entry = {"text": text, "method": r.method, "score": r.score}
+            entry = {"role": role, "text": text, "method": r.method, "score": r.score}
+            if r.matched_alias:
+                entry["alias"] = r.matched_alias
             if r.needs_confirmation:
                 entry["confirm_candidates"] = r.candidates
             elif r.value:
@@ -720,7 +743,8 @@ class QueryOrchestrator:
                 entry["dropped"] = True
             entries.append(entry)
         if entries:
-            explain_sink["columns"] = entries
+            # 追加而非覆盖：group_by / detail / window 各调一次，记录都要保留
+            explain_sink.setdefault("columns", []).extend(entries)
         return resolved, entries
 
     def _resolve_filters(
@@ -746,7 +770,9 @@ class QueryOrchestrator:
                 "exact", "fuzzy", "exact_collision_distance_resolved")
             qualified = r.value if confident else None
             entry = {"text": fe.text, "column_text": col_text, "column": qualified,
-                     "op": fe.op, "value": fe.value}
+                     "op": fe.op, "value": fe.value, "method": r.method, "score": r.score}
+            if r.matched_alias:
+                entry["alias"] = r.matched_alias
             if not confident:
                 entry["dropped"] = True
                 unresolved.append({
@@ -801,7 +827,7 @@ class QueryOrchestrator:
             r, _ = await self._resolve_field(service, MatcherType.TABLE,
                 extraction_json.table_extractions, None, "table", project_id, user_id,
                 query_text=req_text)
-            resolver_explain["table"] = {"method": r.method, "score": r.score}
+            resolver_explain["table"] = _resolved_explain(r)
             if r.needs_confirmation and confirmation is None:
                 confirmation = ("tables", r)
             else:
@@ -812,7 +838,7 @@ class QueryOrchestrator:
             r, _ = await self._resolve_field(service, MatcherType.METRIC,
                 extraction_json.metric_extractions, None, "metric", project_id, user_id,
                 query_text=req_text)
-            resolver_explain["metric"] = {"method": r.method, "score": r.score}
+            resolver_explain["metric"] = _resolved_explain(r)
             if r.needs_confirmation and confirmation is None:
                 confirmation = ("metrics", r)
             else:
@@ -822,7 +848,7 @@ class QueryOrchestrator:
         if extraction_json.group_by_extractions:
             cols, _ = self._resolve_texts_to_columns(
                 service, [e.text for e in extraction_json.group_by_extractions], column_explain,
-                base_table=base_table)
+                base_table=base_table, role="group_by")
             if cols:
                 patch["group_by"] = cols
 
@@ -830,7 +856,7 @@ class QueryOrchestrator:
         if extraction_json.column_extractions:
             cols, _ = self._resolve_texts_to_columns(
                 service, [e.text for e in extraction_json.column_extractions], column_explain,
-                base_table=base_table)
+                base_table=base_table, role="detail")
             if cols:
                 patch["detail_columns"] = cols
 
@@ -856,7 +882,7 @@ class QueryOrchestrator:
             w = parse_window_text(w_text) or parse_window_text(req_text)
             if w:
                 w_cols, _ = self._resolve_texts_to_columns(
-                    service, [w["group_text"]], column_explain, base_table=base_table)
+                    service, [w["group_text"]], column_explain, base_table=base_table, role="window")
                 if w_cols:
                     patch["window"] = {"group_by": w_cols[0], "limit": w["limit"]}
             else:
@@ -941,7 +967,7 @@ class QueryOrchestrator:
         time_explain, column_explain, *, window=None, order_by=None,
     ) -> dict:
         def _field_explain(result, bias):
-            e = {"method": result.method, "score": result.score}
+            e = _resolved_explain(result)
             if bias.get("applied"):
                 e["user_preference_bias"] = bias
             if bias.get("cross_encoder_rerank"):
@@ -1052,6 +1078,14 @@ def _match_user_input_to_candidates(user_input: str, candidates: list[dict]) -> 
         if text_lower in c["value"].lower() or c["value"].lower() in text_lower:
             return c["value"]
     return None
+
+
+def _resolved_explain(r) -> dict:
+    """ResolvedResult → explain（含原话片段、结果与命中别名，供 trace 定位来源）"""
+    e = {"input": r.input_text, "value": r.value, "method": r.method, "score": r.score}
+    if r.matched_alias:
+        e["alias"] = r.matched_alias
+    return e
 
 
 def _first_pending_column(entries: list[dict]) -> Optional[list[dict]]:

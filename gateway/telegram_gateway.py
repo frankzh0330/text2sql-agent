@@ -11,8 +11,11 @@ import httpx
 from bus.message_schema import BusMessage
 from gateway.base import BaseGateway
 from ingress.telegram_adapter import TelegramAdapter
+from service.resolution_trace import trace_in_reply_enabled
 
 logger = logging.getLogger(__name__)
+
+_TELEGRAM_MAX_CHARS = 4096  # Telegram sendMessage 文本上限
 
 
 class TelegramGateway(BaseGateway):
@@ -116,7 +119,15 @@ class TelegramGateway(BaseGateway):
             logger.error("No bus configured, message dropped")
 
     def format_response(self, nl2sql_result: Any) -> str:
-        """格式化响应消息为 Telegram 文本"""
+        """格式化响应消息为 Telegram 文本（TRACE_IN_REPLY=true 时末尾附 resolution trace）"""
+        text = self._format_body(nl2sql_result)
+        if trace_in_reply_enabled():
+            trace = (nl2sql_result.get("explain") or {}).get("trace") or []
+            if trace:
+                text = f"{text}\n\n🔎 Trace\n" + "\n".join(trace)
+        return text[:_TELEGRAM_MAX_CHARS]
+
+    def _format_body(self, nl2sql_result: Any) -> str:
         status = nl2sql_result.get("status", "success")
 
         # 确认流：返回候选列表供用户选择

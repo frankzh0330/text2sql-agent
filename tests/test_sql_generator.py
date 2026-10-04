@@ -117,3 +117,44 @@ class TestEnglishVerbatimSentences:
         o = parse_order_text("Bottom 3 channels by refund rate")
         assert o["metric_text"] == "refund rate"
         assert o["direction"] == "ASC"
+
+
+class TestWindowRepairLoop:
+    """LLM 把分组内 top-N 写成全局 LIMIT n → AST 校验拒绝 → 错误回灌后修正为 LIMIT n BY"""
+
+    def test_plain_limit_is_repaired_to_limit_by(self):
+        import asyncio
+        from unittest import mock
+
+        from matcher.schema_loader import load_sql_schema
+        from service import sql_generator
+        from service.sql_ast_analyzer import build_analysis_context
+
+        head = ("SELECT users.region AS region, sum(orders.amount) AS revenue "
+                "FROM orders JOIN users ON orders.user_id = users.id "
+                "WHERE orders.created_at >= now() - INTERVAL 7 DAY "
+                "GROUP BY users.region ORDER BY revenue DESC ")
+        intent = {
+            "base_table": "orders",
+            "metrics": [{"id": "revenue", "expr": "sum(orders.amount)"}],
+            "group_by": ["users.region"], "filters": [],
+            "time_expr": "orders.created_at >= now() - INTERVAL 7 DAY",
+            "joins": [{"left": "orders", "right": "users", "condition": "orders.user_id = users.id"}],
+            "window": {"group_by": "users.region", "limit": 3},
+        }
+        replies = iter([head + "LIMIT 3", head + "LIMIT 3 BY users.region"])
+        seen_repair_prompts = []
+
+        def fake_llm(messages):
+            seen_repair_prompts.append(messages[0]["content"])
+            return next(replies)
+
+        ctx = build_analysis_context(load_sql_schema("catalog"))
+        with mock.patch.object(sql_generator, "_call_llm", side_effect=fake_llm):
+            sql, explain = asyncio.run(sql_generator.generate_sql(
+                "Top 3 per region", intent, "schema", ["orders", "users"], analysis_context=ctx))
+
+        assert sql.endswith("LIMIT 3 BY users.region")
+        assert explain["repaired"] is True
+        assert explain["rounds"][0]["errors"][0].startswith("missing_limit_by")
+        assert "missing_limit_by" in seen_repair_prompts[1]   # 错误确实回灌给了第二轮

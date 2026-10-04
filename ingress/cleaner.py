@@ -47,8 +47,8 @@ class MessageCleaner:
         # 4. 去除首尾空格
         text = text.strip()
 
-        # 5. 检查清洗后是否为空
-        if not text or len(text) < 2:
+        # 5. 检查清洗后是否为空；纯数字短消息保留（确认流的编号回复，如 "1"）
+        if not text or (len(text) < 2 and not text.isdigit()):
             return ""
 
         return text
@@ -57,5 +57,4 @@ class MessageCleaner:
         """检查文本是否有效"""
         if not text:
             return False
-        cleaned = self.clean(text)
-        return len(cleaned) >= 2
+        return bool(self.clean(text))

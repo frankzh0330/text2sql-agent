@@ -197,6 +197,7 @@ Responsibilities:
 - default LIMIT injection
 - AST analysis: column existence (after sqlglot alias qualification), join edges and ON keys must match the join graph declared in the semantic layer, no JOIN without ON
 - entity fidelity against semantic drift: resolved tables, metric expressions and filter predicates must appear in the SQL
+- per-group ranking ("top 3 per region") must be `LIMIT n BY <group>`; a plain `LIMIT n` is a global top-N, valid SQL with a different meaning, so it is rejected and repaired
 - static cost warnings (estimated scan rows from catalog row counts, unfiltered full scans on fact tables, join depth), recorded in explain only (`explain.resolver_explain.sql_generation.ast_analysis`)
 - analysis errors feed the same repair loop as validation errors; warnings never block
 - deterministic guardrails, independent of the LLM
@@ -547,6 +548,27 @@ The system exposes rich explain/debug information:
 - timing for major layers
 
 This is important because the project is closer to an agent than a one-shot translator.
+
+### Resolution trace
+
+Every request produces a resolution trace ([service/resolution_trace.py](https://github.com/frankzh0330/text2sql-agent/blob/master/service/resolution_trace.py)):
+one line per resolved field saying which phrase it came from, which rule produced it, and the key evidence. It is
+built from the final response (no re-resolution), logged at INFO as `[trace <session_id>] ...`, and returned as
+`explain.trace`. Telegram replies include it only when `TRACE_IN_REPLY=true` (off by default).
+
+```text
+extract   metric=['revenue'] group_by=['region'] time=['last 7 days']
+turn      new_query (no_previous_state)
+metric    'revenue' → revenue · exact · alias 'revenue' · 100
+table     (not given) → orders · inferred_from_metric revenue (declared view)
+group_by  'region' → users.region · exact_collision_distance_resolved · alias 'region' · 100
+time      'last 7 days' → last_n_days n=7 · regex_match
+joins     orders→users ✓
+result    success
+```
+
+Follow-ups show patched vs inherited fields, confirmations show what the user picked, early exits show why
+(e.g. `no_previous_state`), and a missing join shows as `payments→users ✗ no direct join`.
 
 ## Evaluation Strategy
 

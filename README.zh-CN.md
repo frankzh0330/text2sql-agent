@@ -71,6 +71,15 @@ Q2: only gold members, top 3 per region
 
 Q2 继承了 Q1 的指标/时间/分组——每轮只抽取和合并变化的部分。`LIMIT 3 BY` 是 ClickHouse 的分组内排名语法。
 
+## Live Demo
+
+在同一个 Telegram 对话里发 5 条消息：一个初始问题，三个在它基础上 patch 的 follow-up（时间、过滤、分组 top-N），
+以及一个有歧义、Bot 主动询问而不是猜的问题。带截图的分步说明与运行方式见 [docs/LIVE_DEMO.zh-CN.md](docs/LIVE_DEMO.zh-CN.md)。
+
+完整演示文稿（架构讲解 + 本 demo）见 [docs/text2sql-agent.pptx](docs/text2sql-agent.pptx)。
+
+![第 5 步：Bot 询问 amount 指哪个指标，回复 payment 后基于 payments 生成 SQL](docs/images/demo/step5-total-amount-confirm.webp)
+
 ## 关键概念
 
 ### 1. 分层生成
@@ -132,6 +141,7 @@ pip install -r requirements.txt
 | `ZHIPU_MODEL` | No | `glm-4` | 抽取 + SQL 生成模型 |
 | `TOOL_CALLING_ENABLED` | No | `true` | `false` 强制走 prompt-based JSON 输出 |
 | `RERANKER_ENABLED` | No | `false` | `true` 开启歧义匹配的 LLM cross-encoder 重排 |
+| `TRACE_IN_REPLY` | No | `false` | `true` 时在 Telegram 回复末尾附上 resolution trace（每个表 / 指标 / 列来自哪一步）；trace 始终以 INFO 级别写入日志 |
 | `TELEGRAM_BOT_TOKEN` | No | - | Telegram 入口 token |
 | `MESSAGE_BUS_BACKEND` | No | `direct` | `direct` 或 `redis` |
 | `REDIS_URL` | No | `redis://localhost:6379/0` | Redis 地址 |
@@ -242,7 +252,7 @@ text2sql-agent/
 └── tests/                     # 单元 + 集成 + 数据驱动 e2e eval
 ```
 
-## Schema 元数据与生产方向说明
+## Schema 元数据与真实生产环境说明
 
 元数据按企业里的真实分工拆分——每个文件模拟一个独立维护的系统，由 `matcher/schema_loader.py` 中各自的 source adapter 读取，再合并为内存中的 `SQLSchema`（matcher 与 AST analyzer 不感知文件）：
 
@@ -286,7 +296,7 @@ pytest -q
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) / [ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md)：架构、模块职责、匹配与校验细节
 - [EVALUATION.md](docs/EVALUATION.md) / [EVALUATION.zh-CN.md](docs/EVALUATION.zh-CN.md)：eval harness、golden case 与回归策略
 - [MEMORY.md](docs/MEMORY.md) / [MEMORY.zh-CN.md](docs/MEMORY.zh-CN.md)：会话/项目/用户记忆设计
-- [TELEGRAM_TEST.md](docs/TELEGRAM_TEST.md) / [TELEGRAM_TEST.zh-CN.md](docs/TELEGRAM_TEST.zh-CN.md)：Telegram 测试说明
+- [LIVE_DEMO.md](docs/LIVE_DEMO.md) / [LIVE_DEMO.zh-CN.md](docs/LIVE_DEMO.zh-CN.md)：Telegram live demo 分步说明、运行方式与常见问题
 - [docs/diagrams/](docs/diagrams/)：Mermaid 架构图、时序图、流程图与 matcher 时序图
 
 ## 当前状态

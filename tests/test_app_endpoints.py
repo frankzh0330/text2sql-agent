@@ -214,6 +214,33 @@ class TestNL2SQLHappyPath:
         assert body["resolved_intent"]["tables"] == ["orders"]
         assert body["explain"]["resolver_explain"]["table_inference"]["method"] == "inferred_from_metric"
 
+    def test_response_carries_resolution_trace(self, client):
+        """explain["trace"]：每个字段来自哪一步（主表由指标推断）"""
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="客单价")],
+            time_extractions=[Extraction(text="近7天")],
+        )
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql():
+                resp = client.post("/nl2sql", json={"text": "近7天客单价是多少", "project_id": 55})
+
+        trace = resp.json()["explain"]["trace"]
+        assert trace[0].startswith("extract")
+        assert any(l.startswith("table") and "inferred_from_metric" in l and "→ orders" in l for l in trace)
+        assert trace[-1].startswith("result") and "success" in trace[-1]
+
+    def test_early_exit_trace_explains_missing_previous_state(self, client):
+        """无上一轮状态的 follow-up 早退：trace 说明 no_previous_state"""
+        intent = SQLIntentJson(time_extractions=[Extraction(text="yesterday")])
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            resp = client.post("/nl2sql", json={"text": "What about yesterday?", "project_id": 55})
+
+        body = resp.json()
+        assert body["status"] == "early_exit"
+        assert any("no_previous_state" in l for l in body["explain"]["trace"])
+
     def test_nl2sql_returns_session_id(self, client):
         intent = SQLIntentJson(metric_extractions=[Extraction(text="销售额")])
 

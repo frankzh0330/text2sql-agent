@@ -87,6 +87,7 @@ flowchart TD
 | **Metadata** | Catalog | `catalog/tables.yaml` `catalog/metrics.yaml` `catalog/aliases.yaml` `matcher/schema_loader.py` | 三个文件各模拟一个元数据系统（物理 catalog / 语义层 / alias 表），各由一个 source adapter 读取后合并；启动时一次性加载 |
 | **Memory** | Project / User / Writer | `memory/*` | 项目级 corrections、用户偏好弱信号、异步学习 |
 | **Debug** | MCP Server | `mcp_server.py` | token / recall / rerank 调试工具 |
+| | Resolution trace | `service/resolution_trace.py` | 每个字段来自哪一步：INFO 日志 + `explain.trace`；`TRACE_IN_REPLY=true` 时附在 Telegram 回复 |
 
 ### 数据流
 

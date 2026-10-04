@@ -167,3 +167,36 @@ class TestContext:
             tables = None
 
         assert build_analysis_context(Bad()) is None
+
+
+WINDOW_INTENT = {**GOOD_INTENT, "window": {"group_by": "users.region", "limit": 3}}
+WINDOW_SQL_HEAD = """
+SELECT users.region AS region, sum(orders.amount) AS revenue
+FROM orders JOIN users ON orders.user_id = users.id
+WHERE orders.created_at >= now() - INTERVAL 7 DAY AND users.vip_level = 'vip'
+GROUP BY users.region ORDER BY revenue DESC
+"""
+
+
+class TestWindowLimitBy:
+    """分组内 top-N 必须是 LIMIT n BY <分组列>，只写 LIMIT n 会变成全局 top-N"""
+
+    @pytest.mark.parametrize("tail", [
+        "LIMIT 3 BY users.region",
+        "LIMIT 3 BY region",          # SELECT 别名
+    ])
+    def test_limit_by_group_passes(self, ctx, tail):
+        assert analyze_sql(WINDOW_SQL_HEAD + tail, ctx, WINDOW_INTENT).errors == []
+
+    def test_plain_limit_is_rejected(self, ctx):
+        errors = analyze_sql(WINDOW_SQL_HEAD + "LIMIT 3", ctx, WINDOW_INTENT).errors
+        assert len(errors) == 1 and errors[0].startswith("missing_limit_by")
+        assert "LIMIT 3 BY users.region" in errors[0]
+
+    @pytest.mark.parametrize("tail", ["LIMIT 5 BY users.region", "LIMIT 3 BY users.city"])
+    def test_wrong_n_or_group_is_rejected(self, ctx, tail):
+        errors = analyze_sql(WINDOW_SQL_HEAD + tail, ctx, WINDOW_INTENT).errors
+        assert len(errors) == 1 and errors[0].startswith("window_limit_mismatch")
+
+    def test_no_window_intent_allows_plain_limit(self, ctx):
+        assert analyze_sql(WINDOW_SQL_HEAD + "LIMIT 3", ctx, GOOD_INTENT).errors == []

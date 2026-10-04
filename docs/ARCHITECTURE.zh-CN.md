@@ -194,6 +194,7 @@ flowchart TD
 - 默认 LIMIT 注入
 - AST 分析：列存在性（sqlglot 别名解析后）、join 边与 ON 键必须与语义层声明的 join 图一致、JOIN 缺 ON 报错
 - 实体保真（对抗语义漂移）：已解析的表、指标表达式、过滤谓词必须出现在 SQL 中
+- 分组内排名（"top 3 per region"）必须写成 `LIMIT n BY <分组列>`；只写 `LIMIT n` 是全局 top-N，语法合法但语义不同，因此会被拒绝并进入修复循环
 - 静态成本警告（按 catalog 行数估算扫描量、事实表无条件全表扫描、join 深度），只写入 explain（`explain.resolver_explain.sql_generation.ast_analysis`）
 - 分析错误与校验错误一样回灌修复循环；警告不阻断
 - 确定性护栏，独立于 LLM
@@ -542,6 +543,27 @@ Turn 2: 用户回复 "1"
 - 各层 timing
 
 这很重要，因为项目已经更像 agent，而不是一次性翻译器。
+
+### Resolution trace
+
+每次请求都会生成一份 resolution trace（[service/resolution_trace.py](../service/resolution_trace.py)）：
+每个解析出的字段一行，说明它来自哪句原话、由哪条规则得出、关键依据是什么。trace 从最终响应构建（不重复执行解析），
+以 INFO 级别写入日志（`[trace <session_id>] ...`），并放在响应的 `explain.trace` 中。Telegram 回复只有在
+`TRACE_IN_REPLY=true` 时才附带（默认关闭）。
+
+```text
+extract   metric=['revenue'] group_by=['region'] time=['last 7 days']
+turn      new_query (no_previous_state)
+metric    'revenue' → revenue · exact · alias 'revenue' · 100
+table     (not given) → orders · inferred_from_metric revenue (declared view)
+group_by  'region' → users.region · exact_collision_distance_resolved · alias 'region' · 100
+time      'last 7 days' → last_n_days n=7 · regex_match
+joins     orders→users ✓
+result    success
+```
+
+follow-up 会显示哪些字段被 patch、哪些继承；确认流显示用户选了什么；早退显示原因（如 `no_previous_state`）；
+join 缺失显示为 `payments→users ✗ no direct join`。
 
 ## Evaluation 策略
 

@@ -71,6 +71,17 @@ Q2: only gold members, top 3 per region
 
 Q2 inherits metric / time / grouping from Q1 — only the deltas are extracted and merged. `LIMIT 3 BY` is ClickHouse's grouped-ranking syntax.
 
+## Live Demo
+
+Five messages in one Telegram chat: a first question, three follow-ups that patch it (time, filter, top-N per group),
+and an ambiguous question where the bot asks instead of guessing. Step-by-step walkthrough with screenshots and setup:
+[docs/LIVE_DEMO.md](docs/LIVE_DEMO.md).
+
+The full presentation deck — architecture walkthrough plus this demo — is in
+[docs/text2sql-agent.pptx](docs/text2sql-agent.pptx).
+
+![Step 5: the bot asks which metric 'amount' means; replying payment produces SQL on payments](docs/images/demo/step5-total-amount-confirm.webp)
+
 ## Key Concepts
 
 ### 1. Layered Generation
@@ -132,6 +143,7 @@ Common environment variables:
 | `ZHIPU_MODEL` | No | `glm-4` | Extraction + SQL generation model |
 | `TOOL_CALLING_ENABLED` | No | `true` | `false` forces prompt-based JSON output |
 | `RERANKER_ENABLED` | No | `false` | `true` enables LLM cross-encoder reranking for ambiguous matches |
+| `TRACE_IN_REPLY` | No | `false` | `true` appends the resolution trace (where each table / metric / column came from) to Telegram replies; the trace is always logged at INFO |
 | `TELEGRAM_BOT_TOKEN` | No | - | Telegram gateway token |
 | `MESSAGE_BUS_BACKEND` | No | `direct` | `direct` or `redis` |
 | `REDIS_URL` | No | `redis://localhost:6379/0` | Redis URL |
@@ -242,7 +254,7 @@ text2sql-agent/
 └── tests/                     # unit + integration + data-driven e2e evals
 ```
 
-## Schema Metadata & Production Notes
+## Schema Metadata & Real Production Environment
 
 Metadata is split the way it is in an enterprise — each file mocks one independently maintained system and is read by its own source adapter in `matcher/schema_loader.py`, then merged into one in-memory `SQLSchema` (the matcher and AST analyzer never see files):
 
@@ -286,7 +298,7 @@ pytest -q
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) / [ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md): architecture, module ownership, matching and validation details
 - [EVALUATION.md](docs/EVALUATION.md) / [EVALUATION.zh-CN.md](docs/EVALUATION.zh-CN.md): eval harness, golden cases, and regression strategy
 - [MEMORY.md](docs/MEMORY.md) / [MEMORY.zh-CN.md](docs/MEMORY.zh-CN.md): session/project/user memory design
-- [TELEGRAM_TEST.md](docs/TELEGRAM_TEST.md) / [TELEGRAM_TEST.zh-CN.md](docs/TELEGRAM_TEST.zh-CN.md): Telegram testing notes
+- [LIVE_DEMO.md](docs/LIVE_DEMO.md) / [LIVE_DEMO.zh-CN.md](docs/LIVE_DEMO.zh-CN.md): Telegram live demo walkthrough, setup and troubleshooting
 - [docs/diagrams/](docs/diagrams/): Mermaid architecture, sequence, flowchart and matcher-sequence diagrams
 
 ## Current Status

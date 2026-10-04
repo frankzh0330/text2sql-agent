@@ -87,6 +87,14 @@ class TestMessageCleaner:
         cleaner = MessageCleaner()
         assert cleaner.clean("a") == ""
 
+    def test_clean_single_digit_kept_for_confirmation_reply(self):
+        """确认流的编号回复（"1"）只有一个字符，不能被当成空消息丢掉"""
+        from ingress.cleaner import MessageCleaner
+        cleaner = MessageCleaner()
+        assert cleaner.clean("1") == "1"
+        assert cleaner.clean(" 3 ") == "3"
+        assert cleaner.is_valid("1") is True
+
     def test_clean_chinese_preserved(self):
         from ingress.cleaner import MessageCleaner
         cleaner = MessageCleaner()

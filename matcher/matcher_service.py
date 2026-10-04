@@ -21,6 +21,8 @@ class ResolvedResult:
     method: str                     # 见 resolve_with_candidates 的 method 取值
     candidates: List[Dict[str, Any]] = field(default_factory=list)
     needs_confirmation: bool = False  # 是否需要用户确认
+    input_text: str = ""              # 被解析的原话片段（trace 用）
+    matched_alias: Optional[str] = None  # value 命中的别名（trace 用）
 
 
 BiasFn = Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
@@ -74,6 +76,16 @@ class MatcherService:
         query_text = first.text if hasattr(first, "text") else first.get("text", "")
 
         result = self._get_matcher(matcher_type).match(query_text)
+        resolved = self._decide(matcher_type, result, default, base_table, bias)
+        resolved.input_text = query_text
+        resolved.matched_alias = {c["name"]: c.get("alias") for c in result.candidates}.get(resolved.value)
+        return resolved
+
+    def _decide(
+        self, matcher_type: MatcherType, result, default: Optional[str],
+        base_table: Optional[str], bias: Optional[BiasFn],
+    ) -> ResolvedResult:
+        """候选 → 偏好加权 → 冲突处理 → 分档（顺序与阈值见 resolve_with_candidates）"""
         candidates = [{"value": c["name"], "score": float(c["score"])} for c in result.candidates]
         if not candidates and result.matched:
             candidates = [{"value": result.matched, "score": float(result.score)}]
