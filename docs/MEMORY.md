@@ -397,48 +397,4 @@ For example:
 It is already more precise than a text summary.
 So for session memory, AI summarization is usually unnecessary.
 
-## Where AI-Like Selection May Still Help Later
-
-Long-term memory is different; it keeps growing:
-
-- project rules
-- correction rules
-- caveats
-
-As it grows, the system may later need smarter selection for:
-
-- memory snippet choice
-- few-shot example choice
-- ambiguous explanation generation
-
-So “AI retrieval/summarization does not apply” only holds for short-term structured turn state, not for memory as a whole.
-
-## Recommended Next Steps
-
-1. add category-aware project memory retrieval
-2. split `UserAlias`, `UserPattern`, and `UserPreferences` out of simple counts, to take over the personal preferences the judge no longer writes
-3. add persisted `QueryHistory` for replay, pattern aggregation, and failure analysis
-4. consider a hybrid Markdown + embedding index for long-term project memory retrieval
-5. add more project memory / user preference eval cases
-6. add a conflict policy for when project memory and user preference disagree
-7. move file writes to external storage or file locks for multi-process deployments
-
-## User Memory Evolution
-
-Future user memory should not stop at the current lightweight usage counter.
-
-Recommended split:
-
-- `UserAlias`: explicit or learned aliases, e.g. “大单” (big orders) -> `orders.amount > 1000` filter
-- `UserPattern`: aggregated top tables, metrics, columns, query frequency
-- `UserPreferences`: stable defaults, e.g. preferred metric, table, time range
-- `QueryHistory`: persisted query traces for replay, evaluation, pattern learning
-
-Recommended storage:
-
-- PostgreSQL: persisted user records and query history
-- Redis: cache hot per-user/project context
-- optional Vector DB: semantic recall over long-term memory and examples
-
-Even with these capabilities, user memory should stay weaker than explicit input, session state, and
-project memory.
+Planned extensions (user history, smarter long-term memory selection, next steps) are collected on the [Roadmap](/ROADMAP) page.

@@ -47,7 +47,7 @@ Q2 inherits metric / time / grouping from Q1 — only the deltas are extracted a
 ## Where to go next
 
 - [Quickstart & API](https://github.com/frankzh0330/text2sql-agent#quick-start) — run the service, call `POST /nl2sql`, environment variables
-- [Telegram testing](/TELEGRAM_TEST) — end-to-end verification steps over Telegram
+- [Live demo (Telegram)](/LIVE_DEMO) — end-to-end verification steps over Telegram
 - [Architecture](/ARCHITECTURE) — layer responsibilities, dependency direction, scenarios
 - [Evaluation](/EVALUATION) — golden-case harness, live eval, known-gap xfail map
 - [Memory design](/MEMORY) — session / project / user-preference memory layers

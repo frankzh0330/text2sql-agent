@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "luma",
-  "name": "Query Agent",
+  "name": "Text2SQL Agent",
   "colors": {
     "primary": "#848c8e",
     "light": "#11161e",
@@ -15,7 +15,7 @@
   "navbar": {
     "primary": {
       "type": "github",
-      "href": "https://github.com/frankzh0330/query-agent"
+      "href": "https://github.com/frankzh0330/text2sql-agent"
     }
   },
   "navigation": {
@@ -25,21 +25,16 @@
         "pages": ["introduction"]
       },
       {
-        "group": "Core Concepts",
-        "pages": ["ARCHITECTURE", "MEMORY"]
+        "group": "How It Works",
+        "pages": ["ARCHITECTURE", "MATCHER", "SQL_PIPELINE", "MULTI_TURN", "MEMORY"]
       },
       {
         "group": "Guides",
-        "pages": ["TELEGRAM_TEST", "EVALUATION"]
+        "pages": ["LIVE_DEMO", "EVALUATION"]
       },
       {
-        "group": "Diagrams",
-        "pages": [
-          "diagrams/architecture",
-          "diagrams/flowchart",
-          "diagrams/sequence",
-          "diagrams/matcher-sequence"
-        ]
+        "group": "Beyond the Demo",
+        "pages": ["PRODUCTION", "ROADMAP"]
       }
     ]
   },
@@ -50,15 +45,19 @@
     { "source": "/concepts/turn-based-queries", "destination": "/ARCHITECTURE" },
     { "source": "/concepts/memory-layers", "destination": "/MEMORY" },
     { "source": "/concepts/confirmation-flow", "destination": "/ARCHITECTURE" },
-    { "source": "/guides/first-query", "destination": "/TELEGRAM_TEST" },
+    { "source": "/guides/first-query", "destination": "/LIVE_DEMO" },
     { "source": "/guides/multi-turn-sessions", "destination": "/ARCHITECTURE" },
     { "source": "/guides/project-memory", "destination": "/MEMORY" },
-    { "source": "/guides/telegram-integration", "destination": "/TELEGRAM_TEST" },
-    { "source": "/api/nl2dsl", "destination": "/TELEGRAM_TEST" },
+    { "source": "/guides/telegram-integration", "destination": "/LIVE_DEMO" },
+    { "source": "/api/nl2dsl", "destination": "/LIVE_DEMO" },
     { "source": "/api/bearer-query", "destination": "/introduction" },
     { "source": "/api/sessions", "destination": "/ARCHITECTURE" },
     { "source": "/api/request-response", "destination": "/ARCHITECTURE" },
     { "source": "/api/query-state", "destination": "/ARCHITECTURE" },
-    { "source": "/api/status-codes", "destination": "/ARCHITECTURE" }
+    { "source": "/api/status-codes", "destination": "/ARCHITECTURE" },
+    { "source": "/diagrams/architecture", "destination": "/ARCHITECTURE" },
+    { "source": "/diagrams/flowchart", "destination": "/ARCHITECTURE" },
+    { "source": "/diagrams/sequence", "destination": "/ARCHITECTURE" },
+    { "source": "/diagrams/matcher-sequence", "destination": "/ARCHITECTURE" }
   ]
 }
